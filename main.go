@@ -75,14 +75,12 @@ var (
 // ======================== GUI Main ========================
 
 func main() {
-	// Fix blurry text on Windows (Best effort)
 	os.Setenv("FYNE_SCALE", "1")
 
 	myApp := app.NewWithID("com.echworkers.client")
-	// Use default theme which supports English perfectly
 	myApp.Settings().SetTheme(theme.LightTheme())
 
-	w := myApp.NewWindow("ECH Client")
+	w := myApp.NewWindow("ECH Client - Optimized")
 	w.Resize(fyne.NewSize(850, 700))
 	w.CenterOnScreen()
 
@@ -444,7 +442,15 @@ func isChinaIP(host string) bool {
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	
+	// FIX: Enable TCP KeepAlive to detect dead peers faster
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// FIX: REMOVED the deadly 30s deadline
+	// conn.SetDeadline(time.Now().Add(30 * time.Second)) <--- This was the bug
 
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil {
@@ -543,7 +549,7 @@ func doProxy(conn net.Conn, target string, mode string, firstFrame string) {
 	}
 
 	if bypass {
-		remote, err := net.DialTimeout("tcp", target, 5*time.Second)
+		remote, err := net.DialTimeout("tcp", target, 10*time.Second) // Increased timeout
 		if err != nil {
 			return
 		}
@@ -564,6 +570,7 @@ func doProxy(conn net.Conn, target string, mode string, firstFrame string) {
 
 	ws, err := dialWS(currentConfig.ServerAddr, currentConfig.ServerIP, currentConfig.Token)
 	if err != nil {
+		guiLog("WS Connect Error: %v", err)
 		return
 	}
 	defer ws.Close()
@@ -575,26 +582,58 @@ func doProxy(conn net.Conn, target string, mode string, firstFrame string) {
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 
+	// Handshake
 	payload := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
 	ws.WriteMessage(websocket.TextMessage, []byte(payload))
 
 	_, msg, err := ws.ReadMessage()
 	if err != nil || string(msg) != "CONNECTED" {
+		// guiLog("WS Handshake Failed")
 		return
 	}
 
+	// FIX: Mutex for concurrent WebSocket writes (Heartbeat + Data)
+	var wsWriteMu sync.Mutex
+
+	// 1. TCP -> WS Loop
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
+				wsWriteMu.Lock()
 				ws.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
+				wsWriteMu.Unlock()
 				break
 			}
-			ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+			wsWriteMu.Lock()
+			err = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+			wsWriteMu.Unlock()
+			if err != nil {
+				break
+			}
 		}
 	}()
 
+	// 2. Heartbeat Loop (Fix for 60s timeout disconnects)
+	// Cloudflare/Middleboxes often kill idle connections.
+	go func() {
+		ticker := time.NewTicker(15 * time.Second) // Ping every 15s
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				wsWriteMu.Lock()
+				err := ws.WriteMessage(websocket.PingMessage, []byte{})
+				wsWriteMu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	// 3. WS -> TCP Loop (Main blocking loop)
 	for {
 		mt, data, err := ws.ReadMessage()
 		if err != nil {
@@ -603,13 +642,18 @@ func doProxy(conn net.Conn, target string, mode string, firstFrame string) {
 		if mt == websocket.TextMessage && string(data) == "CLOSE" {
 			break
 		}
-		conn.Write(data)
+		// Ignore Ping/Pong, handled by library
+		if mt == websocket.BinaryMessage || mt == websocket.TextMessage {
+			_, err = conn.Write(data)
+			if err != nil {
+				break
+			}
+		}
 	}
 }
 
 // ======================== ECH Logic ========================
 
-// 1. queryHTTPSRecord (DoH)
 func prepareECH(domain, dns string) error {
 	dohURL := dns
 	if !strings.HasPrefix(dohURL, "http") {
@@ -617,15 +661,13 @@ func prepareECH(domain, dns string) error {
 	}
 	u, _ := url.Parse(dohURL)
 	
-	// DNS Query (Type 65 - HTTPS)
-	// Header: ID=0, Flags=RD, QDCOUNT=1
 	q := []byte{0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	for _, label := range strings.Split(domain, ".") {
 		q = append(q, byte(len(label)))
 		q = append(q, []byte(label)...)
 	}
-	q = append(q, 0)             // Root
-	q = append(q, 0, 65, 0, 1)   // Type 65, Class 1
+	q = append(q, 0)
+	q = append(q, 0, 65, 0, 1)
 
 	b64 := base64.RawURLEncoding.EncodeToString(q)
 	query := u.Query()
@@ -641,23 +683,18 @@ func prepareECH(domain, dns string) error {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	// Parse DoH Response
 	if len(body) < 12 { return errors.New("DNS response too short") }
 	idx := 12
-	// Skip Question
 	for idx < len(body) && body[idx] != 0 { idx += int(body[idx]) + 1 }
-	idx += 5 // 0x00 + Type(2) + Class(2)
+	idx += 5
 	
-	// Answers
 	ancount := binary.BigEndian.Uint16(body[6:8])
 	for i := 0; i < int(ancount); i++ {
 		if idx >= len(body) { break }
-		// Name
 		if body[idx]&0xC0 == 0xC0 { idx += 2 } else {
 			for idx < len(body) && body[idx] != 0 { idx += int(body[idx]) + 1 }
 			idx++
 		}
-		// Type, Class, TTL, RDLENGTH
 		if idx+10 > len(body) { break }
 		rtype := binary.BigEndian.Uint16(body[idx : idx+2])
 		rdlen := binary.BigEndian.Uint16(body[idx+8 : idx+10])
@@ -665,22 +702,18 @@ func prepareECH(domain, dns string) error {
 		rdata := body[idx : idx+int(rdlen)]
 		idx += int(rdlen)
 
-		if rtype == 65 { // HTTPS
-			// Parse HTTPS RData
+		if rtype == 65 {
 			p := 0
-			// Priority (2)
 			p += 2
-			// Target Name
 			if p < len(rdata) && rdata[p] == 0 { p++ } else {
 				for p < len(rdata) && rdata[p] != 0 { p += int(rdata[p]) + 1 }
 				p++
 			}
-			// Params (Key-Value pairs)
 			for p+4 <= len(rdata) {
 				key := binary.BigEndian.Uint16(rdata[p : p+2])
 				valLen := binary.BigEndian.Uint16(rdata[p+2 : p+4])
 				p += 4
-				if key == 5 { // ECH Config
+				if key == 5 {
 					echListMu.Lock()
 					echList = rdata[p : p+int(valLen)]
 					echListMu.Unlock()
@@ -690,7 +723,6 @@ func prepareECH(domain, dns string) error {
 			}
 		}
 	}
-	
 	return errors.New("ECH Config not found")
 }
 
@@ -708,7 +740,7 @@ func dialWS(addr, ip, token string) (*websocket.Conn, error) {
 		setECHConfig(tlsConfig, myEch)
 	}
 
-	dialer := websocket.Dialer{TLSClientConfig: tlsConfig, HandshakeTimeout: 5 * time.Second}
+	dialer := websocket.Dialer{TLSClientConfig: tlsConfig, HandshakeTimeout: 10 * time.Second}
 	if ip != "" {
 		dialer.NetDial = func(network, address string) (net.Conn, error) {
 			_, port, _ := net.SplitHostPort(address)
@@ -719,8 +751,12 @@ func dialWS(addr, ip, token string) (*websocket.Conn, error) {
 		dialer.Subprotocols = []string{token}
 	}
 
+	// FIX: Add User-Agent to avoid blocking by some CDNs
+	headers := http.Header{}
+	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
 	url := fmt.Sprintf("wss://%s/", addr)
-	c, _, err := dialer.Dial(url, nil)
+	c, _, err := dialer.Dial(url, headers)
 	return c, err
 }
 
@@ -732,7 +768,6 @@ func setECHConfig(config *tls.Config, echList []byte) {
 	}
 	f2 := v.FieldByName("EncryptedClientHelloRejectionVerify")
 	if f2.IsValid() && f2.CanSet() {
-		// Mock function
 		fn := func(cs tls.ConnectionState) error { return errors.New("rejected") }
 		f2.Set(reflect.ValueOf(fn))
 	}
@@ -777,7 +812,7 @@ func setSystemProxy(enable bool, listen, mode string) bool {
 		}
 		return true
 	} else if runtime.GOOS == "darwin" {
-		svc := "Wi-Fi" // Simplified
+		svc := "Wi-Fi"
 		if enable {
 			exec.Command("networksetup", "-setsocksfirewallproxy", svc, "127.0.0.1", port).Run()
 			exec.Command("networksetup", "-setsocksfirewallproxystate", svc, "on").Run()
