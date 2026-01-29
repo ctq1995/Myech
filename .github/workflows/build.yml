@@ -22,11 +22,11 @@ jobs:
           go-version: '1.21'
 
       - name: Install Dependencies
-        # 安装 Linux Fyne 编译所需的图形库头文件
-        # 安装 MinGW 用于 Windows 交叉编译 (因为 Fyne 使用了 CGO)
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev mingw-w64
+          # === 关键步骤：下载字体文件 ===
+          wget -O font.ttf https://github.com/wordshub/free-font/raw/master/assets/fonts/WenQuanYiMicroHei.ttf
           go mod tidy
 
       - name: Build Windows
@@ -35,8 +35,6 @@ jobs:
           GOOS: windows
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
-        # -H windowsgui: 隐藏 Windows 运行时黑框
-        # -s -w: 去除调试符号，减小体积
         run: go build -ldflags "-H windowsgui -s -w" -o ECHClient.exe main.go
 
       - name: Build Linux
