@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -859,9 +858,6 @@ func loadChinaIPList() {
 			})
 		}
 	}
-	// Sort
-	// (Assumed sorted in source, but we can implement sort if needed. 
-	// The source file is usually sorted.)
 	
 	chinaIPRangesMu.Lock()
 	chinaIPRanges = list
