@@ -5,13 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	_ "embed" // 必须引入 embed 包
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"image/color"
 	"io"
 	"net"
 	"net/http"
@@ -36,36 +34,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// ======================== 字体嵌入与自定义主题 ========================
-
-//go:embed font.ttf
-var embedFont []byte
-
-type chineseTheme struct{}
-
-var _ fyne.Theme = (*chineseTheme)(nil)
-
-func (c chineseTheme) Font(s fyne.TextStyle) fyne.Resource {
-	// 无论什么样式，都强制返回嵌入的中文字体
-	return &fyne.StaticResource{
-		StaticName:    "font.ttf",
-		StaticContent: embedFont,
-	}
-}
-
-func (c chineseTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
-	return theme.DefaultTheme().Color(n, v)
-}
-
-func (c chineseTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
-	return theme.DefaultTheme().Icon(n)
-}
-
-func (c chineseTheme) Size(n fyne.ThemeSizeName) float32 {
-	return theme.DefaultTheme().Size(n)
-}
-
-// ======================== 全局配置结构 ========================
+// ======================== Config Structs ========================
 
 type AppConfig struct {
 	Servers         []ServerConfig `json:"servers"`
@@ -84,7 +53,7 @@ type ServerConfig struct {
 	RoutingMode string `json:"routing"` // global, bypass_cn, none
 }
 
-// ======================== 运行时状态 ========================
+// ======================== Runtime State ========================
 
 var (
 	logType      = binding.NewString()
@@ -103,30 +72,30 @@ var (
 	systemProxyEnabled bool
 )
 
-// ======================== GUI 主界面 ========================
+// ======================== GUI Main ========================
 
 func main() {
+	// Fix blurry text on Windows (Best effort)
 	os.Setenv("FYNE_SCALE", "1")
 
 	myApp := app.NewWithID("com.echworkers.client")
-	
-	// === 核心修复：应用自定义中文字体主题 ===
-	myApp.Settings().SetTheme(&chineseTheme{})
+	// Use default theme which supports English perfectly
+	myApp.Settings().SetTheme(theme.LightTheme())
 
-	w := myApp.NewWindow("ECH Workers 客户端")
+	w := myApp.NewWindow("ECH Client")
 	w.Resize(fyne.NewSize(850, 700))
 	w.CenterOnScreen()
 
 	config := loadConfig()
 	if len(config.Servers) == 0 {
 		config.Servers = append(config.Servers, ServerConfig{
-			ID: "default", Name: "默认配置", ServerAddr: "example.workers.dev:443",
+			ID: "default", Name: "Default Profile", ServerAddr: "example.workers.dev:443",
 			ListenAddr: "127.0.0.1:30000", ECHDomain: "cloudflare-ech.com", RoutingMode: "bypass_cn",
 		})
 		config.CurrentServerID = "default"
 	}
 
-	// --- UI 组件 ---
+	// --- UI Components ---
 	serverCombo := widget.NewSelect([]string{}, nil)
 	refreshServerCombo(serverCombo, config)
 
@@ -137,13 +106,13 @@ func main() {
 	listenEntry.SetPlaceHolder("127.0.0.1:30000")
 	tokenEntry := widget.NewPasswordEntry()
 	ipEntry := widget.NewEntry()
-	ipEntry.SetPlaceHolder("优选IP (可选)")
+	ipEntry.SetPlaceHolder("Preferred IP (Optional)")
 	dnsEntry := widget.NewEntry()
-	dnsEntry.SetPlaceHolder("DoH 地址")
+	dnsEntry.SetPlaceHolder("DoH Address")
 	echEntry := widget.NewEntry()
-	echEntry.SetPlaceHolder("ECH 域名")
+	echEntry.SetPlaceHolder("ECH Domain")
 
-	routingSelect := widget.NewSelect([]string{"全局代理 (global)", "跳过中国大陆 (bypass_cn)", "直连 (none)"}, nil)
+	routingSelect := widget.NewSelect([]string{"Global Proxy", "Bypass Mainland China", "Direct (None)"}, nil)
 
 	fillForm := func(s ServerConfig) {
 		nameEntry.SetText(s.Name)
@@ -153,22 +122,22 @@ func main() {
 		ipEntry.SetText(s.ServerIP)
 		dnsEntry.SetText(s.DNSServer)
 		echEntry.SetText(s.ECHDomain)
-		mode := "全球代理 (global)"
+		mode := "Global Proxy"
 		if s.RoutingMode == "bypass_cn" {
-			mode = "跳过中国大陆 (bypass_cn)"
+			mode = "Bypass Mainland China"
 		}
 		if s.RoutingMode == "none" {
-			mode = "直连 (none)"
+			mode = "Direct (None)"
 		}
 		routingSelect.SetSelected(mode)
 	}
 
 	getForm := func() ServerConfig {
 		mode := "global"
-		if strings.Contains(routingSelect.Selected, "bypass_cn") {
+		if strings.Contains(routingSelect.Selected, "Bypass") {
 			mode = "bypass_cn"
 		}
-		if strings.Contains(routingSelect.Selected, "none") {
+		if strings.Contains(routingSelect.Selected, "Direct") {
 			mode = "none"
 		}
 		return ServerConfig{
@@ -198,7 +167,7 @@ func main() {
 		}
 	}
 
-	saveBtn := widget.NewButtonWithIcon("保存", theme.DocumentSaveIcon(), func() {
+	saveBtn := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
 		idx := serverCombo.SelectedIndex()
 		if idx >= 0 {
 			form := getForm()
@@ -207,12 +176,12 @@ func main() {
 			saveConfig(config)
 			refreshServerCombo(serverCombo, config)
 			serverCombo.SetSelectedIndex(idx)
-			dialog.ShowInformation("成功", "配置已保存", w)
+			dialog.ShowInformation("Success", "Configuration Saved", w)
 		}
 	})
 
-	newBtn := widget.NewButtonWithIcon("新建", theme.ContentAddIcon(), func() {
-		newS := ServerConfig{ID: fmt.Sprintf("%d", time.Now().Unix()), Name: "新配置", ListenAddr: "127.0.0.1:30000", RoutingMode: "bypass_cn"}
+	newBtn := widget.NewButtonWithIcon("New", theme.ContentAddIcon(), func() {
+		newS := ServerConfig{ID: fmt.Sprintf("%d", time.Now().Unix()), Name: "New Profile", ListenAddr: "127.0.0.1:30000", RoutingMode: "bypass_cn"}
 		config.Servers = append(config.Servers, newS)
 		config.CurrentServerID = newS.ID
 		refreshServerCombo(serverCombo, config)
@@ -223,20 +192,20 @@ func main() {
 	logEntry.TextStyle = fyne.TextStyle{Monospace: true}
 	logEntry.Bind(logType)
 
-	startBtn := widget.NewButtonWithIcon("启动代理", theme.MediaPlayIcon(), nil)
-	stopBtn := widget.NewButtonWithIcon("停止", theme.MediaStopIcon(), nil)
-	proxyBtn := widget.NewButton("设置系统代理", nil)
+	startBtn := widget.NewButtonWithIcon("Start Proxy", theme.MediaPlayIcon(), nil)
+	stopBtn := widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), nil)
+	proxyBtn := widget.NewButton("Set System Proxy", nil)
 
 	startBtn.OnTapped = func() {
 		currentConfig = getForm()
 		if currentConfig.ServerAddr == "" {
-			dialog.ShowError(errors.New("请输入服务端地址"), w)
+			dialog.ShowError(errors.New("Server address required"), w)
 			return
 		}
 		logType.Set("")
-		guiLog("正在启动...")
+		guiLog("Starting...")
 		if err := startProxyCore(); err != nil {
-			guiLog("启动失败: " + err.Error())
+			guiLog("Start Failed: " + err.Error())
 			return
 		}
 		saveConfig(config)
@@ -247,28 +216,28 @@ func main() {
 		if systemProxyEnabled {
 			setSystemProxy(false, currentConfig.ListenAddr, currentConfig.RoutingMode)
 			systemProxyEnabled = false
-			proxyBtn.SetText("设置系统代理")
+			proxyBtn.SetText("Set System Proxy")
 		}
 		stopProxyCore()
 		proxyRunning.Set(false)
-		guiLog("代理已停止")
+		guiLog("Proxy Stopped")
 	}
 
 	proxyBtn.OnTapped = func() {
 		systemProxyEnabled = !systemProxyEnabled
 		if systemProxyEnabled {
-			guiLog("正在设置系统代理...")
+			guiLog("Setting System Proxy...")
 			if setSystemProxy(true, currentConfig.ListenAddr, currentConfig.RoutingMode) {
-				proxyBtn.SetText("关闭系统代理")
-				guiLog("系统代理已开启")
+				proxyBtn.SetText("Unset System Proxy")
+				guiLog("System Proxy Enabled")
 			} else {
 				systemProxyEnabled = false
-				guiLog("系统代理开启失败")
+				guiLog("System Proxy Failed")
 			}
 		} else {
 			setSystemProxy(false, currentConfig.ListenAddr, currentConfig.RoutingMode)
-			proxyBtn.SetText("设置系统代理")
-			guiLog("系统代理已关闭")
+			proxyBtn.SetText("Set System Proxy")
+			guiLog("System Proxy Disabled")
 		}
 	}
 
@@ -288,33 +257,33 @@ func main() {
 	}))
 	proxyRunning.Set(false)
 
-	cardServer := widget.NewCard("配置文件", "", container.NewBorder(nil, nil, nil, container.NewHBox(newBtn, saveBtn), serverCombo))
+	cardServer := widget.NewCard("Profile", "", container.NewBorder(nil, nil, nil, container.NewHBox(newBtn, saveBtn), serverCombo))
 	form := container.NewVBox(
 		widget.NewForm(
-			widget.NewFormItem("配置名称", nameEntry),
-			widget.NewFormItem("服务地址", addrEntry),
-			widget.NewFormItem("本地监听", listenEntry),
+			widget.NewFormItem("Name", nameEntry),
+			widget.NewFormItem("Server Addr", addrEntry),
+			widget.NewFormItem("Local Listen", listenEntry),
 			widget.NewFormItem("Auth Token", tokenEntry),
-			widget.NewFormItem("优选 IP", ipEntry),
+			widget.NewFormItem("Preferred IP", ipEntry),
 		),
 		widget.NewForm(
-			widget.NewFormItem("DoH 服务器", dnsEntry),
-			widget.NewFormItem("ECH 域名", echEntry),
-			widget.NewFormItem("分流模式", routingSelect),
+			widget.NewFormItem("DoH Server", dnsEntry),
+			widget.NewFormItem("ECH Domain", echEntry),
+			widget.NewFormItem("Routing", routingSelect),
 		),
 	)
-	cardSettings := widget.NewCard("参数设置", "", form)
+	cardSettings := widget.NewCard("Settings", "", form)
 	ctrlBox := container.NewHBox(startBtn, stopBtn, layout.NewSpacer(), proxyBtn)
 	logContainer := container.NewGridWrap(fyne.NewSize(800, 200), logEntry)
-	cardControl := widget.NewCard("运行控制", "", container.NewVBox(ctrlBox, logContainer))
+	cardControl := widget.NewCard("Control", "", container.NewVBox(ctrlBox, logContainer))
 
 	content := container.NewVBox(cardServer, cardSettings, cardControl)
 	w.SetContent(content)
 
 	if desk, ok := myApp.(desktop.App); ok {
 		menu := fyne.NewMenu("ECH Client",
-			fyne.NewMenuItem("显示", func() { w.Show() }),
-			fyne.NewMenuItem("退出", func() {
+			fyne.NewMenuItem("Show", func() { w.Show() }),
+			fyne.NewMenuItem("Quit", func() {
 				if systemProxyEnabled {
 					setSystemProxy(false, currentConfig.ListenAddr, currentConfig.RoutingMode)
 				}
@@ -346,7 +315,7 @@ func guiLog(format string, args ...any) {
 	defer logMu.Unlock()
 	if logBuffer.Len() > 10000 {
 		logBuffer.Reset()
-		logBuffer.WriteString("... (日志清除) ...\n")
+		logBuffer.WriteString("... (Log Truncated) ...\n")
 	}
 	ts := time.Now().Format("15:04:05")
 	line := fmt.Sprintf("[%s] %s\n", ts, msg)
@@ -364,7 +333,7 @@ func startProxyCore() error {
 		currentConfig.DNSServer = "dns.alidns.com/dns-query"
 	}
 
-	guiLog("正在获取 ECH 配置 (%s)...", currentConfig.ECHDomain)
+	guiLog("Fetching ECH Config (%s)...", currentConfig.ECHDomain)
 	if err := prepareECH(currentConfig.ECHDomain, currentConfig.DNSServer); err != nil {
 		return err
 	}
@@ -381,7 +350,7 @@ func startProxyCore() error {
 	proxyContext, proxyCancel = context.WithCancel(context.Background())
 
 	go func() {
-		guiLog("代理已启动: %s", currentConfig.ListenAddr)
+		guiLog("Proxy Started: %s", currentConfig.ListenAddr)
 		for {
 			conn, err := l.Accept()
 			if err != nil {
@@ -414,7 +383,7 @@ func loadChinaIPList() {
 	url := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt"
 	resp, err := http.Get(url)
 	if err != nil {
-		guiLog("IP列表下载失败: %v", err)
+		guiLog("Failed to download IP list: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -437,7 +406,7 @@ func loadChinaIPList() {
 	chinaIPRangesMu.Lock()
 	chinaIPRanges = ranges
 	chinaIPRangesMu.Unlock()
-	guiLog("已在线加载 %d 条分流规则", len(ranges))
+	guiLog("Loaded %d China IP rules", len(ranges))
 }
 
 func ipToUint32(ip net.IP) uint32 {
@@ -640,7 +609,7 @@ func doProxy(conn net.Conn, target string, mode string, firstFrame string) {
 
 // ======================== ECH Logic ========================
 
-// 1. queryHTTPSRecord (DoH 解析逻辑)
+// 1. queryHTTPSRecord (DoH)
 func prepareECH(domain, dns string) error {
 	dohURL := dns
 	if !strings.HasPrefix(dohURL, "http") {
@@ -648,7 +617,7 @@ func prepareECH(domain, dns string) error {
 	}
 	u, _ := url.Parse(dohURL)
 	
-	// 构造 DNS Query (Type 65 - HTTPS)
+	// DNS Query (Type 65 - HTTPS)
 	// Header: ID=0, Flags=RD, QDCOUNT=1
 	q := []byte{0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0}
 	for _, label := range strings.Split(domain, ".") {
@@ -672,8 +641,8 @@ func prepareECH(domain, dns string) error {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	// 简单解析 DoH 响应 (寻找 ECH Config)
-	if len(body) < 12 { return errors.New("DNS响应太短") }
+	// Parse DoH Response
+	if len(body) < 12 { return errors.New("DNS response too short") }
 	idx := 12
 	// Skip Question
 	for idx < len(body) && body[idx] != 0 { idx += int(body[idx]) + 1 }
@@ -722,7 +691,7 @@ func prepareECH(domain, dns string) error {
 		}
 	}
 	
-	return errors.New("未找到ECH配置")
+	return errors.New("ECH Config not found")
 }
 
 func dialWS(addr, ip, token string) (*websocket.Conn, error) {
@@ -808,7 +777,7 @@ func setSystemProxy(enable bool, listen, mode string) bool {
 		}
 		return true
 	} else if runtime.GOOS == "darwin" {
-		svc := "Wi-Fi" // 简化处理，实际应遍历所有服务
+		svc := "Wi-Fi" // Simplified
 		if enable {
 			exec.Command("networksetup", "-setsocksfirewallproxy", svc, "127.0.0.1", port).Run()
 			exec.Command("networksetup", "-setsocksfirewallproxystate", svc, "on").Run()
