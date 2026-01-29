@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	_ "embed" // 必须引入 embed 包
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/color"
 	"io"
 	"net"
 	"net/http"
@@ -34,6 +36,35 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ======================== 字体嵌入与自定义主题 ========================
+
+//go:embed font.ttf
+var embedFont []byte
+
+type chineseTheme struct{}
+
+var _ fyne.Theme = (*chineseTheme)(nil)
+
+func (c chineseTheme) Font(s fyne.TextStyle) fyne.Resource {
+	// 无论什么样式，都强制返回嵌入的中文字体
+	return &fyne.StaticResource{
+		StaticName:    "font.ttf",
+		StaticContent: embedFont,
+	}
+}
+
+func (c chineseTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	return theme.DefaultTheme().Color(n, v)
+}
+
+func (c chineseTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(n)
+}
+
+func (c chineseTheme) Size(n fyne.ThemeSizeName) float32 {
+	return theme.DefaultTheme().Size(n)
+}
+
 // ======================== 全局配置结构 ========================
 
 type AppConfig struct {
@@ -56,34 +87,31 @@ type ServerConfig struct {
 // ======================== 运行时状态 ========================
 
 var (
-	// GUI 绑定变量
-	logType      = binding.NewString() // 用于 GUI 显示日志
-	proxyRunning = binding.NewBool()   // 代理运行状态
+	logType      = binding.NewString()
+	proxyRunning = binding.NewBool()
 
-	// 核心运行时变量
-	currentConfig  ServerConfig
-	proxyListener  net.Listener
-	proxyContext   context.Context
-	proxyCancel    context.CancelFunc
+	currentConfig ServerConfig
+	proxyListener net.Listener
+	proxyContext  context.Context
+	proxyCancel   context.CancelFunc
 
-	// IP 列表缓存
 	echListMu       sync.RWMutex
 	echList         []byte
 	chinaIPRangesMu sync.RWMutex
 	chinaIPRanges   []ipRange
 
-	// 系统代理状态
 	systemProxyEnabled bool
 )
 
 // ======================== GUI 主界面 ========================
 
 func main() {
-	// 解决 Windows 高 DPI 模糊问题 (Best effort)
 	os.Setenv("FYNE_SCALE", "1")
 
 	myApp := app.NewWithID("com.echworkers.client")
-	myApp.Settings().SetTheme(theme.LightTheme())
+	
+	// === 核心修复：应用自定义中文字体主题 ===
+	myApp.Settings().SetTheme(&chineseTheme{})
 
 	w := myApp.NewWindow("ECH Workers 客户端")
 	w.Resize(fyne.NewSize(850, 700))
