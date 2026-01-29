@@ -1,4 +1,4 @@
-name: Build App
+name: Build Release
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build All
+    name: Build Windows & Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,38 +22,23 @@ jobs:
           go-version: '1.21'
 
       - name: Install Dependencies
-        # Linux下交叉编译Fyne需要一些C库的头文件支持
+        # 安装 Linux Fyne 编译所需的图形库头文件
+        # 安装 MinGW 用于 Windows 交叉编译 (因为 Fyne 使用了 CGO)
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev mingw-w64
           go mod tidy
 
-      # --- Windows 构建 ---
       - name: Build Windows
         env:
           CGO_ENABLED: 1
           GOOS: windows
           GOARCH: amd64
-          CC: x86_64-w64-mingw32-gcc # 使用 MinGW 进行 CGO 交叉编译
-        run: |
-           sudo apt-get install -y mingw-w64
-           go build -ldflags "-H windowsgui -s -w" -o ECHClient.exe main.go
+          CC: x86_64-w64-mingw32-gcc
+        # -H windowsgui: 隐藏 Windows 运行时黑框
+        # -s -w: 去除调试符号，减小体积
+        run: go build -ldflags "-H windowsgui -s -w" -o ECHClient.exe main.go
 
-      # --- macOS 构建 ---
-      - name: Build macOS
-        # 注意: Fyne 在 Linux 上交叉编译 macOS 可能有图形库兼容问题
-        # 稳妥起见，我们仅在 macOS runner 上编译 Mac 版，或者这里我们直接编译二进制文件
-        # 如果需要 .app 包，必须在 macos-latest 上运行。
-        # 这里为了简化为一个 job，我们尝试只编译二进制。
-        env:
-          CGO_ENABLED: 1
-          GOOS: darwin
-          GOARCH: amd64
-          # 交叉编译 macOS 需要 osxcross，GitHub Ubuntu 环境默认没有，配置极其复杂
-          # 所以：我们把 macOS 构建拆分到另一个 job (见下文 job: build-mac)
-        run: echo "Skipping macOS build in Ubuntu runner"
-
-      # --- Linux 构建 ---
       - name: Build Linux
         env:
           CGO_ENABLED: 1
@@ -64,50 +49,24 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-ubuntu
+          name: binaries
           path: |
             ECHClient.exe
             ECHClient-Linux
 
-  # 单独的 Job 构建 macOS (因为 Fyne 需要 CGO 和原生图形库)
-  build-mac:
-    name: Build macOS
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      
-      - name: Build Mac Binary
-        # 不使用 fyne package，直接编译二进制，无图标但能运行
-        run: |
-          go mod tidy
-          go build -ldflags "-s -w" -o ECHClient-Mac main.go
-
-      - name: Upload Mac Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: binary-mac
-          path: ECHClient-Mac
-
   release:
-    name: Release
-    needs: [build, build-mac]
+    name: Create Release
+    needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
-        with: 
-          name: binaries-ubuntu
-      - uses: actions/download-artifact@v4
         with:
-          name: binary-mac
+          name: binaries
 
-      - name: Create Release
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             ECHClient.exe
             ECHClient-Linux
-            ECHClient-Mac
