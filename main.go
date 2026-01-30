@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -59,8 +60,17 @@ type ServerConfig struct {
 var (
 	logType      = binding.NewString()
 	proxyRunning = binding.NewBool()
+	
+	// Stats Binding
+	statusLabel  = binding.NewString()
+	speedUpload  = binding.NewString()
+	speedDownload = binding.NewString()
+	latencyShow   = binding.NewString()
 
-	// Current active config
+	// Traffic Counters (Atomic)
+	totalUp   uint64
+	totalDown uint64
+
 	activeConfig ServerConfig
 
 	proxyListener net.Listener
@@ -89,8 +99,8 @@ func main() {
 	myApp := app.NewWithID("com.echworkers.client")
 	myApp.Settings().SetTheme(theme.LightTheme())
 
-	w := myApp.NewWindow("ECH Client - Pro")
-	w.Resize(fyne.NewSize(850, 700))
+	w := myApp.NewWindow("ECH Client Pro")
+	w.Resize(fyne.NewSize(900, 750))
 	w.CenterOnScreen()
 
 	config := loadConfig()
@@ -101,6 +111,14 @@ func main() {
 		})
 		config.CurrentServerID = "default"
 	}
+
+	// --- Stats Monitor ---
+	statusLabel.Set("Status: Stopped")
+	speedUpload.Set("Up: 0 KB/s")
+	speedDownload.Set("Down: 0 KB/s")
+	latencyShow.Set("Latency: - ms")
+
+	go startSpeedMonitor()
 
 	// --- UI Components ---
 	serverCombo := widget.NewSelect([]string{}, nil)
@@ -115,7 +133,7 @@ func main() {
 	ipEntry := widget.NewEntry()
 	ipEntry.SetPlaceHolder("Preferred IP (Optional)")
 	dnsEntry := widget.NewEntry()
-	dnsEntry.SetPlaceHolder("DoH Address (Default: Alidns)")
+	dnsEntry.SetPlaceHolder("DoH Address")
 	echEntry := widget.NewEntry()
 	echEntry.SetPlaceHolder("ECH Domain")
 
@@ -195,6 +213,24 @@ func main() {
 		serverCombo.SetSelectedIndex(len(config.Servers) - 1)
 	})
 
+	// --- Control Buttons ---
+	
+	pingBtn := widget.NewButtonWithIcon("Ping", theme.ViewRefreshIcon(), func() {
+		cfg := getForm()
+		if cfg.ServerAddr == "" { return }
+		go func() {
+			latencyShow.Set("Pinging...")
+			ms, err := measureLatency(cfg)
+			if err != nil {
+				latencyShow.Set("Error")
+				guiLog("Ping Failed: %v", err)
+			} else {
+				latencyShow.Set(fmt.Sprintf("Latency: %d ms", ms))
+				guiLog("Ping Result: %d ms", ms)
+			}
+		}()
+	})
+
 	logEntry := widget.NewMultiLineEntry()
 	logEntry.TextStyle = fyne.TextStyle{Monospace: true}
 	logEntry.Bind(logType)
@@ -209,12 +245,8 @@ func main() {
 			dialog.ShowError(errors.New("Server address required"), w)
 			return
 		}
-		if activeConfig.ECHDomain == "" {
-			activeConfig.ECHDomain = "cloudflare-ech.com"
-		}
-		if activeConfig.DNSServer == "" {
-			activeConfig.DNSServer = "dns.alidns.com/dns-query"
-		}
+		if activeConfig.ECHDomain == "" { activeConfig.ECHDomain = "cloudflare-ech.com" }
+		if activeConfig.DNSServer == "" { activeConfig.DNSServer = "dns.alidns.com/dns-query" }
 
 		logType.Set("")
 		guiLog("Initializing...")
@@ -224,6 +256,7 @@ func main() {
 		}
 		saveConfig(config)
 		proxyRunning.Set(true)
+		statusLabel.Set("Status: Running")
 	}
 
 	stopBtn.OnTapped = func() {
@@ -234,6 +267,7 @@ func main() {
 		}
 		stopProxyCore()
 		proxyRunning.Set(false)
+		statusLabel.Set("Status: Stopped")
 		guiLog("Proxy Stopped")
 	}
 
@@ -271,7 +305,9 @@ func main() {
 	}))
 	proxyRunning.Set(false)
 
+	// --- Layout ---
 	cardServer := widget.NewCard("Profile", "", container.NewBorder(nil, nil, nil, container.NewHBox(newBtn, saveBtn), serverCombo))
+	
 	form := container.NewVBox(
 		widget.NewForm(
 			widget.NewFormItem("Name", nameEntry),
@@ -287,13 +323,28 @@ func main() {
 		),
 	)
 	cardSettings := widget.NewCard("Settings", "", form)
+
+	// Status Bar
+	statBox := container.NewHBox(
+		widget.NewLabelWithData(statusLabel),
+		layout.NewSpacer(),
+		widget.NewLabelWithData(speedDownload),
+		widget.NewLabel("|"),
+		widget.NewLabelWithData(speedUpload),
+		layout.NewSpacer(),
+		widget.NewLabelWithData(latencyShow),
+		pingBtn,
+	)
+	cardStats := widget.NewCard("Monitor", "", statBox)
+
 	ctrlBox := container.NewHBox(startBtn, stopBtn, layout.NewSpacer(), proxyBtn)
-	logContainer := container.NewGridWrap(fyne.NewSize(800, 200), logEntry)
+	logContainer := container.NewGridWrap(fyne.NewSize(800, 180), logEntry)
 	cardControl := widget.NewCard("Control", "", container.NewVBox(ctrlBox, logContainer))
 
-	content := container.NewVBox(cardServer, cardSettings, cardControl)
+	content := container.NewVBox(cardServer, cardSettings, cardStats, cardControl)
 	w.SetContent(content)
 
+	// --- System Tray & Close Logic ---
 	if desk, ok := myApp.(desktop.App); ok {
 		menu := fyne.NewMenu("ECH Client",
 			fyne.NewMenuItem("Show", func() { w.Show() }),
@@ -310,6 +361,61 @@ func main() {
 	w.SetCloseIntercept(func() { w.Hide() })
 	w.ShowAndRun()
 }
+
+// ======================== Monitor & Tools ========================
+
+func startSpeedMonitor() {
+	var lastUp, lastDown uint64
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		currUp := atomic.LoadUint64(&totalUp)
+		currDown := atomic.LoadUint64(&totalDown)
+
+		upRate := currUp - lastUp
+		downRate := currDown - lastDown
+
+		lastUp = currUp
+		lastDown = currDown
+
+		speedUpload.Set(fmt.Sprintf("Up: %s/s", formatBytes(upRate)))
+		speedDownload.Set(fmt.Sprintf("Down: %s/s", formatBytes(downRate)))
+	}
+}
+
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func measureLatency(cfg ServerConfig) (int64, error) {
+	host, port, _ := net.SplitHostPort(cfg.ServerAddr)
+	if host == "" { host = cfg.ServerAddr; port = "443" }
+	
+	target := host + ":" + port
+	if cfg.ServerIP != "" {
+		target = cfg.ServerIP + ":" + port
+	}
+
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", target, 3*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	return time.Since(start).Milliseconds(), nil
+}
+
+// ======================== Core Helpers ========================
 
 func refreshServerCombo(combo *widget.Select, config AppConfig) {
 	names := []string{}
@@ -337,7 +443,7 @@ func guiLog(format string, args ...any) {
 	logType.Set(logBuffer.String())
 }
 
-// ======================== Core Networking (Ported from ech-workers.go) ========================
+// ======================== Networking Core ========================
 
 func startProxyCore() error {
 	guiLog("Fetching ECH Config (%s)...", activeConfig.ECHDomain)
@@ -357,7 +463,7 @@ func startProxyCore() error {
 	proxyContext, proxyCancel = context.WithCancel(context.Background())
 
 	go func() {
-		guiLog("Proxy Started: %s (SOCKS5/HTTP)", activeConfig.ListenAddr)
+		guiLog("Proxy Started: %s", activeConfig.ListenAddr)
 		for {
 			conn, err := l.Accept()
 			if err != nil {
@@ -384,43 +490,55 @@ func stopProxyCore() {
 	}
 }
 
-// --- Connection Handling ---
+// Wraps net.Conn to count bytes
+type CountConn struct {
+	net.Conn
+}
+
+func (c *CountConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if n > 0 {
+		atomic.AddUint64(&totalDown, uint64(n))
+	}
+	return
+}
+
+func (c *CountConn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if n > 0 {
+		atomic.AddUint64(&totalUp, uint64(n))
+	}
+	return
+}
 
 func handleConnection(conn net.Conn) {
+	// Wrap connection for statistics
+	conn = &CountConn{Conn: conn}
+	
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Peek first byte to determine protocol
 	buf := make([]byte, 1)
 	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return
-	}
+	if err != nil || n == 0 { return }
 	firstByte := buf[0]
 
 	switch firstByte {
-	case 0x05: // SOCKS5
+	case 0x05:
 		handleSOCKS5(conn, firstByte)
-	case 'C', 'G', 'P', 'H', 'D', 'O', 'T': // HTTP Methods
+	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
 		handleHTTP(conn, firstByte)
-	default:
-		// Unknown
 	}
 }
 
-// --- SOCKS5 ---
-
 func handleSOCKS5(conn net.Conn, firstByte byte) {
-	// Handshake
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
 	nmethods := buf[0]
 	methods := make([]byte, nmethods)
 	if _, err := io.ReadFull(conn, methods); err != nil { return }
+	conn.Write([]byte{0x05, 0x00})
 
-	conn.Write([]byte{0x05, 0x00}) // No auth
-
-	// Request
 	buf = make([]byte, 4)
 	if _, err := io.ReadFull(conn, buf); err != nil { return }
 	cmd := buf[1]
@@ -428,17 +546,17 @@ func handleSOCKS5(conn net.Conn, firstByte byte) {
 
 	var host string
 	switch atyp {
-	case 0x01: // IPv4
+	case 0x01:
 		ip := make([]byte, 4)
 		io.ReadFull(conn, ip)
 		host = net.IP(ip).String()
-	case 0x03: // Domain
+	case 0x03:
 		lb := make([]byte, 1)
 		io.ReadFull(conn, lb)
 		dom := make([]byte, lb[0])
 		io.ReadFull(conn, dom)
 		host = string(dom)
-	case 0x04: // IPv6
+	case 0x04:
 		ip := make([]byte, 16)
 		io.ReadFull(conn, ip)
 		host = net.IP(ip).String()
@@ -449,18 +567,14 @@ func handleSOCKS5(conn net.Conn, firstByte byte) {
 	port := binary.BigEndian.Uint16(pBuf)
 	target := fmt.Sprintf("%s:%d", host, port)
 
-	if cmd == 0x01 { // CONNECT
+	if cmd == 0x01 {
 		handleTunnel(conn, target, 1, "")
 	} else {
-		// Unsupported cmd
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	}
 }
 
-// --- HTTP Proxy ---
-
 func handleHTTP(conn net.Conn, firstByte byte) {
-	// Reconstruct reader
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn))
 	reqLine, err := reader.ReadString('\n')
 	if err != nil { return }
@@ -469,7 +583,6 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 	if len(parts) < 3 { return }
 	method, urlStr, ver := parts[0], parts[1], parts[2]
 
-	// Read headers
 	var headers []string
 	var hostHeader string
 	for {
@@ -484,7 +597,6 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 	if method == "CONNECT" {
 		handleTunnel(conn, urlStr, 2, "")
 	} else {
-		// Normal HTTP Proxy
 		target := hostHeader
 		if target == "" {
 			u, _ := url.Parse(urlStr)
@@ -492,9 +604,7 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 		}
 		if !strings.Contains(target, ":") { target += ":80" }
 
-		// Rebuild request
 		var buf bytes.Buffer
-		// Transform absolute URL to relative path if needed
 		path := urlStr
 		if strings.HasPrefix(urlStr, "http://") {
 			if u, err := url.Parse(urlStr); err == nil {
@@ -503,7 +613,6 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 				if path == "" { path = "/" }
 			}
 		}
-		
 		fmt.Fprintf(&buf, "%s %s %s\r\n", method, path, ver)
 		for _, h := range headers {
 			if !strings.HasPrefix(strings.ToLower(h), "proxy-") {
@@ -512,31 +621,23 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 		}
 		buf.WriteString("\r\n")
 
-		// Consume body if present (simple check)
 		if n := reader.Buffered(); n > 0 {
 			b := make([]byte, n)
 			reader.Read(b)
 			buf.Write(b)
 		}
-
 		handleTunnel(conn, target, 3, buf.String())
 	}
 }
 
-// --- Tunneling ---
-
 func handleTunnel(conn net.Conn, target string, mode int, firstFrame string) {
-	// 1. Bypass Check
 	host, _, _ := net.SplitHostPort(target)
 	if shouldBypass(host) {
-		guiLog("Bypass: %s", target)
 		handleDirect(conn, target, mode, firstFrame)
 		return
 	}
 
-	// 2. Proxy via WebSocket
-	guiLog("Proxy: %s", target)
-	ws, err := dialWebSocketWithECH(2) // Retry twice
+	ws, err := dialWebSocketWithECH(2)
 	if err != nil {
 		sendError(conn, mode)
 		return
@@ -545,7 +646,6 @@ func handleTunnel(conn net.Conn, target string, mode int, firstFrame string) {
 
 	conn.SetDeadline(time.Time{})
 
-	// Handshake
 	payload := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
 	ws.WriteMessage(websocket.TextMessage, []byte(payload))
 
@@ -555,19 +655,15 @@ func handleTunnel(conn net.Conn, target string, mode int, firstFrame string) {
 		return
 	}
 
-	// Send Success to Client
-	if mode == 1 { // SOCKS5
+	if mode == 1 {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	} else if mode == 2 { // HTTP CONNECT
+	} else if mode == 2 {
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
-	// Mode 3 (HTTP Direct) sends nothing, just forwards
 
-	// 3. Pipe
 	var mu sync.Mutex
 	done := make(chan bool, 2)
 
-	// Heartbeat
 	go func() {
 		tk := time.NewTicker(10 * time.Second)
 		defer tk.Stop()
@@ -583,14 +679,11 @@ func handleTunnel(conn net.Conn, target string, mode int, firstFrame string) {
 		}
 	}()
 
-	// Conn -> WS
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := conn.Read(buf)
-			if err != nil {
-				break
-			}
+			if err != nil { break }
 			mu.Lock()
 			ws.WriteMessage(websocket.BinaryMessage, buf[:n])
 			mu.Unlock()
@@ -598,7 +691,6 @@ func handleTunnel(conn net.Conn, target string, mode int, firstFrame string) {
 		done <- true
 	}()
 
-	// WS -> Conn
 	go func() {
 		for {
 			mt, data, err := ws.ReadMessage()
@@ -644,24 +736,20 @@ func sendError(conn net.Conn, mode int) {
 	}
 }
 
-// ======================== ECH & WS Logic ========================
+// ======================== ECH Logic ========================
 
 func prepareECH(domain, dns string) error {
 	dohURL := dns
 	if !strings.HasPrefix(dohURL, "http") { dohURL = "https://" + dohURL }
 	
-	// Query DoH
 	u, _ := url.Parse(dohURL)
 	dnsQuery := make([]byte, 0, 512)
-	// Header
 	dnsQuery = append(dnsQuery, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0)
-	// QName
 	for _, l := range strings.Split(domain, ".") {
 		dnsQuery = append(dnsQuery, byte(len(l)))
 		dnsQuery = append(dnsQuery, []byte(l)...)
 	}
 	dnsQuery = append(dnsQuery, 0)
-	// Type 65 (HTTPS), Class 1 (IN)
 	dnsQuery = append(dnsQuery, 0, 65, 0, 1)
 
 	b64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
@@ -678,46 +766,37 @@ func prepareECH(domain, dns string) error {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
-	// Parse HTTPS Record for ECH
-	// Simplified parser for brevity, assumes standard structure
 	if len(body) < 12 { return errors.New("DNS response too short") }
 	
-	// Skip Header(12) + Question
 	idx := 12
 	for idx < len(body) && body[idx] != 0 { idx += int(body[idx]) + 1 }
-	idx += 5 // Root(1) + Type(2) + Class(2)
+	idx += 5
 	
 	ancount := binary.BigEndian.Uint16(body[6:8])
 	for i := 0; i < int(ancount); i++ {
 		if idx >= len(body) { break }
-		// Skip Name
 		if body[idx]&0xC0 == 0xC0 { idx += 2 } else {
 			for idx < len(body) && body[idx] != 0 { idx += int(body[idx]) + 1 }
 			idx++
 		}
-		// Skip Type, Class, TTL
 		if idx+8 > len(body) { break }
 		rtype := binary.BigEndian.Uint16(body[idx:idx+2])
 		idx += 8
-		// RDLen
 		rdlen := binary.BigEndian.Uint16(body[idx:idx+2])
 		idx += 2
 		
-		if rtype == 65 { // HTTPS
+		if rtype == 65 {
 			rdata := body[idx : idx+int(rdlen)]
-			// Parse RData
-			p := 2 // Priority
-			// Target Name
+			p := 2
 			if p < len(rdata) && rdata[p] == 0 { p++ } else {
 				for p < len(rdata) && rdata[p] != 0 { p += int(rdata[p]) + 1 }
 				p++
 			}
-			// Params
 			for p+4 <= len(rdata) {
 				key := binary.BigEndian.Uint16(rdata[p:p+2])
 				valLen := binary.BigEndian.Uint16(rdata[p+2:p+4])
 				p += 4
-				if key == 5 { // ECH
+				if key == 5 {
 					echListMu.Lock()
 					echList = rdata[p : p+int(valLen)]
 					echListMu.Unlock()
@@ -728,7 +807,7 @@ func prepareECH(domain, dns string) error {
 		}
 		idx += int(rdlen)
 	}
-	return errors.New("ECH Config not found in DNS")
+	return errors.New("ECH Config not found")
 }
 
 func dialWebSocketWithECH(retries int) (*websocket.Conn, error) {
@@ -744,7 +823,6 @@ func dialWebSocketWithECH(retries int) (*websocket.Conn, error) {
 			prepareECH(activeConfig.ECHDomain, activeConfig.DNSServer)
 		}
 
-		// Build TLS Config
 		roots, _ := x509.SystemCertPool()
 		tlsCfg := &tls.Config{
 			MinVersion: tls.VersionTLS13,
@@ -752,7 +830,6 @@ func dialWebSocketWithECH(retries int) (*websocket.Conn, error) {
 			RootCAs: roots,
 		}
 		
-		// Set ECH via Reflection
 		v := reflect.ValueOf(tlsCfg).Elem()
 		f := v.FieldByName("EncryptedClientHelloConfigList")
 		if f.IsValid() { f.Set(reflect.ValueOf(curECH)) }
@@ -770,7 +847,6 @@ func dialWebSocketWithECH(retries int) (*websocket.Conn, error) {
 			dialer.Subprotocols = []string{activeConfig.Token}
 		}
 		
-		// IP Override
 		if activeConfig.ServerIP != "" {
 			dialer.NetDial = func(network, addr string) (net.Conn, error) {
 				return net.Dial(network, activeConfig.ServerIP+":"+port)
@@ -791,10 +867,8 @@ func dialWebSocketWithECH(retries int) (*websocket.Conn, error) {
 func shouldBypass(host string) bool {
 	if activeConfig.RoutingMode == "none" { return true }
 	if activeConfig.RoutingMode == "global" { return false }
-	// bypass_cn
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// Resolve
 		ips, err := net.LookupIP(host)
 		if err != nil || len(ips) == 0 { return false }
 		ip = ips[0]
@@ -806,11 +880,8 @@ func isChinaIP(ip net.IP) bool {
 	ip4 := ip.To4()
 	if ip4 == nil { return false }
 	val := binary.BigEndian.Uint32(ip4)
-	
 	chinaIPRangesMu.RLock()
 	defer chinaIPRangesMu.RUnlock()
-	
-	// Binary Search
 	l, r := 0, len(chinaIPRanges)
 	for l < r {
 		m := (l + r) / 2
@@ -827,7 +898,6 @@ func isChinaIP(ip net.IP) bool {
 }
 
 func loadChinaIPList() {
-	// Download if not exists or empty
 	path := "chn_ip.txt"
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		guiLog("Downloading China IP List...")
@@ -858,14 +928,11 @@ func loadChinaIPList() {
 			})
 		}
 	}
-	
 	chinaIPRangesMu.Lock()
 	chinaIPRanges = list
 	chinaIPRangesMu.Unlock()
 	guiLog("Loaded %d CN IP Rules", len(list))
 }
-
-// ======================== Config & System ========================
 
 func loadConfig() AppConfig {
 	var cfg AppConfig
