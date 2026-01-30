@@ -19,7 +19,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.21'
 
       - name: Install Dependencies
         run: |
@@ -27,12 +27,56 @@ jobs:
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev mingw-w64
           go mod tidy
 
-      - name: Install go-winres (for Windows icon)
+      - name: Install go-winres
         run: go install github.com/tc-hib/go-winres@latest
 
-      - name: Generate Windows Resource File
+      - name: Create winres directory and config
         run: |
-          ~/go/bin/go-winres make --icon icon.ico --product-version=git-tag --file-version=git-tag
+          mkdir -p winres
+          cp icon.ico winres/icon.ico
+          cat > winres/winres.json << 'EOF'
+          {
+            "RT_GROUP_ICON": {
+              "APP": {
+                "0000": ["icon.ico"]
+              }
+            },
+            "RT_MANIFEST": {
+              "#1": {
+                "0409": {
+                  "description": "ECH Client",
+                  "minimum-os": "win7",
+                  "execution-level": "as invoker",
+                  "ui-access": false,
+                  "dpi-awareness": "system"
+                }
+              }
+            },
+            "RT_VERSION": {
+              "#1": {
+                "0000": {
+                  "fixed": {
+                    "file_version": "1.0.0.0",
+                    "product_version": "1.0.0.0"
+                  },
+                  "info": {
+                    "0409": {
+                      "CompanyName": "Your Company",
+                      "FileDescription": "ECH Client Application",
+                      "LegalCopyright": "Copyright (C) 2024",
+                      "OriginalFilename": "ECHClient.exe",
+                      "ProductName": "ECH Client",
+                      "ProductVersion": "1.0.0"
+                    }
+                  }
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Generate Windows Resource File
+        run: ~/go/bin/go-winres make
 
       - name: Build Windows
         env:
