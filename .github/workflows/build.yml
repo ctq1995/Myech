@@ -30,15 +30,28 @@ jobs:
       - name: Install go-winres
         run: go install github.com/tc-hib/go-winres@latest
 
-      - name: Create winres directory and config
+      - name: Convert ICO to PNG (if needed)
+        run: |
+          # 如果你的 icon.ico 实际是 PNG，就重命名
+          # 或者使用 ImageMagick 转换
+          sudo apt-get install -y imagemagick
+          
+          # 方法1：如果 icon.ico 实际是 PNG
+          # cp icon.ico icon.png
+          
+          # 方法2：从 ICO 提取最大尺寸的图标为 PNG
+          convert icon.ico[0] icon.png || cp icon.ico icon.png
+          
+      - name: Create winres config with PNG
         run: |
           mkdir -p winres
-          cp icon.ico winres/icon.ico
+          
+          # 使用 PNG 文件（go-winres 会自动生成多种尺寸）
           cat > winres/winres.json << 'EOF'
           {
             "RT_GROUP_ICON": {
               "APP": {
-                "0000": ["icon.ico"]
+                "0000": "icon.png"
               }
             },
             "RT_MANIFEST": {
@@ -65,8 +78,7 @@ jobs:
                       "FileDescription": "ECH Client Application",
                       "LegalCopyright": "Copyright (C) 2024",
                       "OriginalFilename": "ECHClient.exe",
-                      "ProductName": "ECH Client",
-                      "ProductVersion": "1.0.0"
+                      "ProductName": "ECH Client"
                     }
                   }
                 }
@@ -74,6 +86,9 @@ jobs:
             }
           }
           EOF
+          
+          # 复制 PNG 到 winres 目录
+          cp icon.png winres/
 
       - name: Generate Windows Resource File
         run: ~/go/bin/go-winres make
