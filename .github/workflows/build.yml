@@ -19,13 +19,20 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.25'
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev mingw-w64
           go mod tidy
+
+      - name: Install go-winres (for Windows icon)
+        run: go install github.com/tc-hib/go-winres@latest
+
+      - name: Generate Windows Resource File
+        run: |
+          ~/go/bin/go-winres make --icon icon.ico --product-version=git-tag --file-version=git-tag
 
       - name: Build Windows
         env:
