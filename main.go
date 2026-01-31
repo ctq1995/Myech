@@ -1,26 +1,23 @@
 package main
-
 import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"image/color"
 	"io"
-	"math/big"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -34,791 +31,997 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/gorilla/websocket"
+	"golang.org/x/sys/windows/registry"
 )
 
-// ======================== 资源与主题 ========================
 
-//go:embed font.ttf
-var embedFontData []byte
+// 自定义深色主题
+type customTheme struct{}
 
-type CompactTheme struct{}
-
-var _ fyne.Theme = (*CompactTheme)(nil)
-
-func (m CompactTheme) Font(s fyne.TextStyle) fyne.Resource {
-	return &fyne.StaticResource{StaticName: "font.ttf", StaticContent: embedFontData}
+func (t *customTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	switch name {
+	case theme.ColorNameBackground:
+		return color.NRGBA{R: 30, G: 30, B: 35, A: 255}
+	case theme.ColorNameButton:
+		return color.NRGBA{R: 55, G: 55, B: 65, A: 255}
+	case theme.ColorNameDisabledButton:
+		return color.NRGBA{R: 45, G: 45, B: 50, A: 255}
+	case theme.ColorNameDisabled:
+		return color.NRGBA{R: 100, G: 100, B: 100, A: 255}
+	case theme.ColorNameForeground:
+		return color.NRGBA{R: 220, G: 220, B: 225, A: 255}
+	case theme.ColorNameHover:
+		return color.NRGBA{R: 70, G: 70, B: 80, A: 255}
+	case theme.ColorNameInputBackground:
+		return color.NRGBA{R: 40, G: 40, B: 48, A: 255}
+	case theme.ColorNameInputBorder:
+		return color.NRGBA{R: 80, G: 80, B: 90, A: 255}
+	case theme.ColorNamePlaceHolder:
+		return color.NRGBA{R: 120, G: 120, B: 130, A: 255}
+	case theme.ColorNamePrimary:
+		return color.NRGBA{R: 65, G: 150, B: 255, A: 255}
+	case theme.ColorNameScrollBar:
+		return color.NRGBA{R: 80, G: 80, B: 90, A: 255}
+	case theme.ColorNameSeparator:
+		return color.NRGBA{R: 60, G: 60, B: 70, A: 255}
+	case theme.ColorNameShadow:
+		return color.NRGBA{R: 0, G: 0, B: 0, A: 100}
+	case theme.ColorNameSuccess:
+		return color.NRGBA{R: 76, G: 175, B: 80, A: 255}
+	case theme.ColorNameWarning:
+		return color.NRGBA{R: 255, G: 152, B: 0, A: 255}
+	case theme.ColorNameError:
+		return color.NRGBA{R: 244, G: 67, B: 54, A: 255}
+	default:
+		return theme.DefaultTheme().Color(name, variant)
+	}
 }
 
-func (m CompactTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
-	if n == theme.ColorNamePrimary {
-		return color.RGBA{R: 0, G: 110, B: 220, A: 255}
-	}
-	if n == theme.ColorNameBackground {
-		return color.RGBA{R: 248, G: 248, B: 250, A: 255}
-	}
-	return theme.DefaultTheme().Color(n, theme.VariantLight)
+func (t *customTheme) Font(style fyne.TextStyle) fyne.Resource {
+	return theme.DefaultTheme().Font(style)
 }
 
-func (m CompactTheme) Icon(n fyne.ThemeIconName) fyne.Resource {
-	return theme.DefaultTheme().Icon(n)
+func (t *customTheme) Icon(name fyne.ThemeIconName) fyne.Resource {
+	return theme.DefaultTheme().Icon(name)
 }
 
-func (m CompactTheme) Size(n fyne.ThemeSizeName) float32 {
-	if n == theme.SizeNamePadding {
-		return 2
-	}
-	if n == theme.SizeNameText {
+func (t *customTheme) Size(name fyne.ThemeSizeName) float32 {
+	switch name {
+	case theme.SizeNamePadding:
+		return 6
+	case theme.SizeNameInlineIcon:
+		return 20
+	case theme.SizeNameScrollBar:
 		return 12
+	case theme.SizeNameText:
+		return 14
+	default:
+		return theme.DefaultTheme().Size(name)
 	}
-	return theme.DefaultTheme().Size(n)
 }
-
-// ======================== 数据结构 ========================
-
-type AppConfig struct {
-	Servers         []ServerConfig `json:"servers"`
-	CurrentServerID string         `json:"current_server_id"`
-	BypassDomains   []string       `json:"bypass_domains"`
-	BypassKeywords  []string       `json:"bypass_keywords"`
-}
-
-type ServerConfig struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	ServerAddr  string `json:"server"`
-	ListenAddr  string `json:"listen"`
-	Token       string `json:"token"`
-	ServerIP    string `json:"ip"`
-	DNSServer   string `json:"dns"`
-	ECHDomain   string `json:"ech"`
-	RoutingMode string `json:"routing"`
-}
-
-type ipRange struct {
-	start, end uint32
-}
-
-// ======================== 全局变量 ========================
-
 var (
-	logData      = binding.NewString()
-	proxyRunning = binding.NewBool()
+	listenAddr  string
+	serverAddr  string
+	serverIP    string
+	token       string
+	dnsServer   string
+	echDomain   string
+	routingMode string
+	autoProxy   bool // 新增：是否自动设置系统代理
 
-	statusText = binding.NewString()
-	latencyStr = binding.NewString()
+	echListMu sync.RWMutex
+	echList   []byte
 
-	speedUpStr   = binding.NewString()
-	speedDownStr = binding.NewString()
-	totalStr     = binding.NewString()
-
-	infoDetails = binding.NewString()
-
-	activeConfig  ServerConfig
-	globalRules   AppConfig
-	proxyListener net.Listener
-	proxyCtx      context.Context
-	proxyCancel   context.CancelFunc
-
-	echListMu       sync.RWMutex
-	echList         []byte
 	chinaIPRangesMu sync.RWMutex
 	chinaIPRanges   []ipRange
 
-	totalUp            uint64
-	totalDown          uint64
-	systemProxyEnabled bool
+	chinaIPV6RangesMu sync.RWMutex
+	chinaIPV6Ranges   []ipRangeV6
+
+	totalUpload   atomic.Uint64
+	totalDownload atomic.Uint64
+	isRunning     atomic.Bool
+	proxyListener net.Listener
+	statusText    = binding.NewString()
+	uploadSpeed   = binding.NewString()
+	downloadSpeed = binding.NewString()
+	logMutex      sync.Mutex
+	currentLogs   []string
+	logTextWidget *widget.Entry // 使用 Entry 显示日志
 )
 
-// ======================== 主程序 ========================
+
+// 系统代理设置
+func setSystemProxy(enable bool, proxyAddr string) error {
+	if runtime.GOOS != "windows" {
+		log.Printf("[系统代理] 当前系统 %s 暂不支持自动设置", runtime.GOOS)
+		return nil
+	}
+
+	key, err := registry.OpenKey(registry.CURRENT_USER,
+		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
+		registry.SET_VALUE|registry.QUERY_VALUE)
+	if err != nil {
+		return fmt.Errorf("打开注册表失败: %w", err)
+	}
+	defer key.Close()
+
+	if enable {
+		// 启用代理
+		if err := key.SetDWordValue("ProxyEnable", 1); err != nil {
+			return fmt.Errorf("设置 ProxyEnable 失败: %w", err)
+		}
+		if err := key.SetStringValue("ProxyServer", proxyAddr); err != nil {
+			return fmt.Errorf("设置 ProxyServer 失败: %w", err)
+		}
+		// 设置不代理的地址
+		bypass := "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>"
+		if err := key.SetStringValue("ProxyOverride", bypass); err != nil {
+			return fmt.Errorf("设置 ProxyOverride 失败: %w", err)
+		}
+		log.Printf("[系统代理] 已启用: %s", proxyAddr)
+	} else {
+		// 禁用代理
+		if err := key.SetDWordValue("ProxyEnable", 0); err != nil {
+			return fmt.Errorf("禁用代理失败: %w", err)
+		}
+		log.Printf("[系统代理] 已禁用")
+	}
+
+	// 通知系统代理设置已更改
+	refreshSystemProxy()
+	return nil
+}
+
+// 刷新系统代理设置（通知IE/Edge等应用）
+func refreshSystemProxy() {
+	if runtime.GOOS == "windows" {
+		// 使用 PowerShell 刷新代理设置
+		cmd := exec.Command("powershell", "-Command",
+			`[System.Net.WebRequest]::DefaultWebProxy = [System.Net.WebRequest]::GetSystemWebProxy()`)
+		cmd.Run()
+	}
+}
+
+
+type ipRange struct {
+	start uint32
+	end   uint32
+}
+
+type ipRangeV6 struct {
+	start [16]byte
+	end   [16]byte
+}
+type guiLogWriter struct{}
+
+func (w *guiLogWriter) Write(p []byte) (n int, err error) {
+	msg := string(bytes.TrimSpace(p))
+	os.Stdout.Write(p)
+
+	logMutex.Lock()
+	timeStr := time.Now().Format("15:04:05")
+	logLine := fmt.Sprintf("[%s] %s", timeStr, msg)
+	currentLogs = append(currentLogs, logLine)
+
+	// 只保留最新100条
+	if len(currentLogs) > 100 {
+		currentLogs = currentLogs[len(currentLogs)-100:]
+	}
+
+	// 合并为单个字符串
+	logText := strings.Join(currentLogs, "\n")
+	logMutex.Unlock()
+
+	// 更新日志显示
+	if logTextWidget != nil {
+		fyne.Do(func() {
+			logTextWidget.SetText(logText)
+			// 滚动到底部
+			logTextWidget.CursorRow = len(currentLogs)
+		})
+	}
+
+	return len(p), nil
+}
+
+
+func formatSize(s float64) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	i := 0
+	for s >= 1024 && i < len(units)-1 {
+		s /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", s, units[i])
+}
+
+func formatSpeed(s float64) string {
+	units := []string{"B/s", "KB/s", "MB/s", "GB/s"}
+	i := 0
+	for s >= 1024 && i < len(units)-1 {
+		s /= 1024
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", s, units[i])
+}
+
+// 创建带标签的输入框组件
+func createLabeledEntry(label string, entry *widget.Entry) *fyne.Container {
+	lbl := widget.NewLabel(label)
+	lbl.TextStyle = fyne.TextStyle{Bold: true}
+	return container.NewBorder(nil, nil, container.NewGridWrap(fyne.NewSize(100, 30), lbl), nil, entry)
+}
+
+// 创建带标签的选择框组件
+func createLabeledSelect(label string, sel *widget.Select) *fyne.Container {
+	lbl := widget.NewLabel(label)
+	lbl.TextStyle = fyne.TextStyle{Bold: true}
+	return container.NewBorder(nil, nil, container.NewGridWrap(fyne.NewSize(100, 30), lbl), nil, sel)
+}
+
+// 创建卡片容器
+func createCard(title string, content fyne.CanvasObject) *fyne.Container {
+	titleLabel := widget.NewLabel(title)
+	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	titleBg := canvas.NewRectangle(color.NRGBA{R: 45, G: 45, B: 55, A: 255})
+	titleBg.SetMinSize(fyne.NewSize(0, 32))
+
+	titleContainer := container.NewStack(titleBg, container.NewPadded(titleLabel))
+
+	contentBg := canvas.NewRectangle(color.NRGBA{R: 38, G: 38, B: 45, A: 255})
+	contentContainer := container.NewStack(contentBg, content)
+
+	return container.NewBorder(titleContainer, nil, nil, nil, contentContainer)
+}
+
+
+// 创建状态指示器
+func createStatusIndicator(running bool) *canvas.Circle {
+	circle := canvas.NewCircle(color.NRGBA{R: 100, G: 100, B: 100, A: 255})
+	if running {
+		circle.FillColor = color.NRGBA{R: 76, G: 175, B: 80, A: 255}
+	} else {
+		circle.FillColor = color.NRGBA{R: 244, G: 67, B: 54, A: 255}
+	}
+	circle.Resize(fyne.NewSize(12, 12))
+	return circle
+}
 
 func main() {
+	log.SetOutput(&guiLogWriter{})
+	log.SetFlags(0)
 
-	os.Setenv("FYNE_SCALE", "1.0")
-	myApp := app.NewWithID("com.echworkers.client")
-	myApp.SetIcon(theme.DefaultTheme().Icon(theme.IconNameHome))
-	myApp.Settings().SetTheme(&CompactTheme{})
-	checkECHSupport()
+	myApp := app.NewWithID("com.echproxy.gui")
+	myApp.Settings().SetTheme(&customTheme{})
 
-	w := myApp.NewWindow("ECH Client")
-	w.Resize(fyne.NewSize(700, 450))
-	w.CenterOnScreen()
+	myWindow := myApp.NewWindow("ECH Proxy Client")
+	myWindow.Resize(fyne.NewSize(1000, 700))
+	myWindow.CenterOnScreen()
 
-	config := loadConfig()
-	initDefaultRules(&config)
-	globalRules = config
+	// 加载偏好设置
+	prefs := myApp.Preferences()
+	listenAddr = prefs.StringWithFallback("listenAddr", "127.0.0.1:30000")
+	serverAddr = prefs.StringWithFallback("serverAddr", "")
+	serverIP = prefs.StringWithFallback("serverIP", "")
+	token = prefs.StringWithFallback("token", "")
+	dnsServer = prefs.StringWithFallback("dnsServer", "dns.alidns.com/dns-query")
+	echDomain = prefs.StringWithFallback("echDomain", "cloudflare-ech.com")
+	routingMode = prefs.StringWithFallback("routingMode", "global")
+	autoProxy = prefs.BoolWithFallback("autoProxy", true)
 
-	resetStats()
-	go startStatsMonitor()
+	// 初始化绑定值
+	statusText.Set("已停止")
+	uploadSpeed.Set("0 B/s")
+	downloadSpeed.Set("0 B/s")
 
-	dashboardTab := buildDashboard(w, &config)
-	profileTab := buildProfileEditor(w, &config)
-	advancedTab := buildAdvancedTab(&config)
+	// 上传下载总量绑定
+	uploadTotal := binding.NewString()
+	uploadTotal.Set("0 B")
+	downloadTotal := binding.NewString()
+	downloadTotal.Set("0 B")
 
-	tabs := container.NewAppTabs(
-		container.NewTabItemWithIcon("控制台", theme.HomeIcon(), dashboardTab),
-		container.NewTabItemWithIcon("节点", theme.SettingsIcon(), profileTab),
-		container.NewTabItemWithIcon("日志", theme.InfoIcon(), advancedTab),
-	)
-	tabs.SetTabLocation(container.TabLocationLeading)
-
-	w.SetContent(tabs)
-	w.SetCloseIntercept(func() { w.Hide() })
-
-	if desk, ok := myApp.(desktop.App); ok {
-		desk.SetSystemTrayMenu(fyne.NewMenu("ECH",
-			fyne.NewMenuItem("显示", func() { w.Show() }),
-			fyne.NewMenuItem("退出", func() {
-				if systemProxyEnabled {
-					setSystemProxy(false, activeConfig.ListenAddr, activeConfig.RoutingMode)
-				}
-				myApp.Quit()
-			}),
-		))
-	}
-	w.ShowAndRun()
-}
-
-// ======================== ECH 支持检测 ========================
-
-func checkECHSupport() {
-	tlsCfg := &tls.Config{}
-	v := reflect.ValueOf(tlsCfg).Elem()
-	f := v.FieldByName("EncryptedClientHelloConfigList")
-
-	if f.IsValid() && f.CanSet() {
-		guiLog("[信息] ✓ Go版本支持ECH (Go %s)", runtime.Version())
-	} else {
-		guiLog("[错误] ✗ Go版本不支持ECH (Go %s)，需要 Go 1.23+", runtime.Version())
-	}
-}
-
-// ======================== 界面构建 ========================
-
-func buildDashboard(w fyne.Window, config *AppConfig) fyne.CanvasObject {
-	statusDot := canvas.NewCircle(color.RGBA{200, 200, 200, 255})
-	statusDot.Resize(fyne.NewSize(12, 12))
-	statusDot.MinSize()
-
+	// ========== 状态面板 ==========
+	statusIndicator := createStatusIndicator(false)
 	statusLabel := widget.NewLabelWithData(statusText)
 	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
 
-	latencyLabel := widget.NewLabelWithData(latencyStr)
-
-	currentProfileLabel := widget.NewLabel("配置: " + getCurrentProfileName(config))
-	currentProfileLabel.TextStyle = fyne.TextStyle{Monospace: true}
-
-	topBar := container.NewHBox(
-		statusDot, statusLabel,
-		widget.NewSeparator(),
-		widget.NewIcon(theme.InfoIcon()), latencyLabel,
-		layout.NewSpacer(),
-		currentProfileLabel,
+	statusRow := container.NewHBox(
+		statusIndicator,
+		widget.NewLabel("状态:"),
+		statusLabel,
 	)
 
-	makeStatCard := func(title string, val binding.String, icon fyne.Resource, col color.Color) fyne.CanvasObject {
-		vLabel := widget.NewLabelWithData(val)
-		vLabel.TextStyle = fyne.TextStyle{Bold: true, Monospace: true}
-		vLabel.Alignment = fyne.TextAlignCenter
+	// 速度和流量使用固定宽度标签
+	uploadSpeedLabel := widget.NewLabelWithData(uploadSpeed)
+	downloadSpeedLabel := widget.NewLabelWithData(downloadSpeed)
+	uploadTotalLabel := widget.NewLabelWithData(uploadTotal)
+	downloadTotalLabel := widget.NewLabelWithData(downloadTotal)
 
-		tLabel := canvas.NewText(title, col)
-		tLabel.TextSize = 10
-		tLabel.Alignment = fyne.TextAlignCenter
-
-		return widget.NewCard("", "", container.NewVBox(
-			container.NewCenter(widget.NewIcon(icon)),
-			vLabel,
-			container.NewCenter(tLabel),
-		))
+	// 固定宽度的标签容器
+	createFixedLabel := func(text string, width float32) *fyne.Container {
+		lbl := widget.NewLabel(text)
+		return container.NewGridWrap(fyne.NewSize(width, 25), lbl)
 	}
 
-	trafficGrid := container.NewGridWithColumns(3,
-		makeStatCard("上传速度", speedUpStr, theme.UploadIcon(), theme.PrimaryColor()),
-		makeStatCard("下载速度", speedDownStr, theme.DownloadIcon(), theme.PrimaryColor()),
-		makeStatCard("总流量", totalStr, theme.HistoryIcon(), color.Gray{Y: 100}),
+	createFixedValueLabel := func(label *widget.Label, width float32) *fyne.Container {
+		return container.NewGridWrap(fyne.NewSize(width, 25), label)
+	}
+
+	// 速度行
+	speedRow := container.NewHBox(
+		widget.NewIcon(theme.UploadIcon()),
+		createFixedLabel("上传:", 45),
+		createFixedValueLabel(uploadSpeedLabel, 90),
+		widget.NewSeparator(),
+		widget.NewIcon(theme.DownloadIcon()),
+		createFixedLabel("下载:", 45),
+		createFixedValueLabel(downloadSpeedLabel, 90),
 	)
 
-	infoLabel := widget.NewLabelWithData(infoDetails)
-	infoLabel.Wrapping = fyne.TextWrapWord
-
-	// ✅ 添加滚动到详情卡片
-	infoScroll := container.NewScroll(infoLabel)
-	infoScroll.SetMinSize(fyne.NewSize(0, 120))
-	
-	infoCard := widget.NewCard("节点详情", "", infoScroll)
-
-	startBtn := widget.NewButton("启动代理", nil)
-	stopBtn := widget.NewButton("停止", nil)
-	startBtn.Importance = widget.HighImportance
-	stopBtn.Disable()
-
-	sysProxyCheck := widget.NewCheck("系统代理", func(checked bool) {
-		systemProxyEnabled = checked
-		if proxyListener != nil {
-			setSystemProxy(checked, activeConfig.ListenAddr, activeConfig.RoutingMode)
-		}
-	})
-
-	startBtn.OnTapped = func() {
-		idx := getProfileIndex(config, config.CurrentServerID)
-		if idx == -1 {
-			dialog.ShowError(errors.New("无效配置"), w)
-			return
-		}
-		activeConfig = config.Servers[idx]
-
-		// ✅ 显示更详细的配置信息
-		details := fmt.Sprintf("服务器: %s\n监听地址: %s\nECH域名: %s\nDNS服务器: %s\n路由模式: %s",
-			activeConfig.ServerAddr, 
-			activeConfig.ListenAddr, 
-			activeConfig.ECHDomain, 
-			activeConfig.DNSServer,
-			activeConfig.RoutingMode)
-		
-		if activeConfig.ServerIP != "" {
-			details += fmt.Sprintf("\n指定IP: %s", activeConfig.ServerIP)
-		}
-		
-		infoDetails.Set(details)
-		currentProfileLabel.SetText("配置: " + activeConfig.Name)
-
-		logData.Set("")
-		guiLog("正在启动...")
-		if err := startProxyCore(); err != nil {
-			guiLog("失败: %v", err)
-			dialog.ShowError(err, w)
-			return
-		}
-
-		proxyRunning.Set(true)
-		statusText.Set("运行中")
-		statusDot.FillColor = color.RGBA{0, 200, 0, 255}
-		statusDot.Refresh()
-
-		startBtn.Disable()
-		stopBtn.Enable()
-		if systemProxyEnabled {
-			setSystemProxy(true, activeConfig.ListenAddr, activeConfig.RoutingMode)
-		}
-		go latencyMonitorLoop()
-	}
-
-	stopBtn.OnTapped = func() {
-		setSystemProxy(false, activeConfig.ListenAddr, activeConfig.RoutingMode)
-		stopProxyCore()
-		proxyRunning.Set(false)
-		statusText.Set("已停止")
-		statusDot.FillColor = color.RGBA{200, 50, 50, 255}
-		statusDot.Refresh()
-
-		startBtn.Enable()
-		stopBtn.Disable()
-		latencyStr.Set("-")
-		guiLog("服务已停止")
-	}
-
-	ctrlGrid := container.NewGridWithColumns(2, startBtn, stopBtn)
-
-	mainContent := container.NewVBox(
-		topBar,
+	// 流量行
+	trafficRow := container.NewHBox(
+		createFixedLabel("↑ 已上传:", 75),
+		createFixedValueLabel(uploadTotalLabel, 90),
 		widget.NewSeparator(),
-		trafficGrid,
-		widget.NewSeparator(),
-		infoCard,
-		layout.NewSpacer(),
-		sysProxyCheck,
-		ctrlGrid,
+		createFixedLabel("↓ 已下载:", 75),
+		createFixedValueLabel(downloadTotalLabel, 90),
 	)
 
-	return container.NewPadded(mainContent)
-}
+	statsContent := container.NewVBox(
+		container.NewPadded(statusRow),
+		widget.NewSeparator(),
+		container.NewPadded(speedRow),
+		widget.NewSeparator(),
+		container.NewPadded(trafficRow),
+	)
+	statsCard := createCard("📊 运行状态", statsContent)
 
+	// ========== 配置面板 ==========
+	labelWidth := float32(90)
+	entryWidth := float32(260)
 
-func buildProfileEditor(w fyne.Window, config *AppConfig) fyne.CanvasObject {
-	nameEntry := widget.NewEntry()
-	serverEntry := widget.NewEntry()
+	// 统一的表单行创建函数
+	createFormRow := func(labelText string, w fyne.CanvasObject) *fyne.Container {
+		lbl := widget.NewLabel(labelText)
+		lbl.TextStyle = fyne.TextStyle{Bold: true}
+		labelBox := container.NewGridWrap(fyne.NewSize(labelWidth, 36), lbl)
+		entryBox := container.NewGridWrap(fyne.NewSize(entryWidth, 36), w)
+		return container.NewHBox(labelBox, entryBox)
+	}
+
 	listenEntry := widget.NewEntry()
+	listenEntry.SetText(listenAddr)
+	listenEntry.SetPlaceHolder("127.0.0.1:30000")
+
+	serverEntry := widget.NewEntry()
+	serverEntry.SetText(serverAddr)
+	serverEntry.SetPlaceHolder("your-worker.workers.dev:443")
+
 	tokenEntry := widget.NewPasswordEntry()
-	ipEntry := widget.NewEntry()
-	
-	// ✅ 新增：ECH 和 DNS 配置
-	echEntry := widget.NewEntry()
-	echEntry.SetPlaceHolder("cloudflare-ech.com")
-	
+	tokenEntry.SetText(token)
+	tokenEntry.SetPlaceHolder("可选的认证令牌")
+
+	serverIPEntry := widget.NewEntry()
+	serverIPEntry.SetText(serverIP)
+	serverIPEntry.SetPlaceHolder("可选，指定服务器IP")
+
 	dnsEntry := widget.NewEntry()
-	dnsEntry.SetPlaceHolder("dns.alidns.com/dns-query")
+	dnsEntry.SetText(dnsServer)
 
-	routingSelect := widget.NewSelect([]string{"bypass_cn", "global", "none"}, nil)
+	echEntry := widget.NewEntry()
+	echEntry.SetText(echDomain)
 
-	listData := binding.NewStringList()
-	reloadList := func() {
-		var names []string
-		for _, s := range config.Servers {
-			names = append(names, s.Name)
-		}
-		listData.Set(names)
-	}
-	reloadList()
-
-	profileList := widget.NewListWithData(listData,
-		func() fyne.CanvasObject { return widget.NewLabel("template") },
-		func(i binding.DataItem, o fyne.CanvasObject) {
-			o.(*widget.Label).Bind(i.(binding.String))
-		},
-	)
-
-	profileList.OnSelected = func(id widget.ListItemID) {
-		if id >= len(config.Servers) {
-			return
-		}
-		s := config.Servers[id]
-		config.CurrentServerID = s.ID
-		nameEntry.SetText(s.Name)
-		serverEntry.SetText(s.ServerAddr)
-		listenEntry.SetText(s.ListenAddr)
-		tokenEntry.SetText(s.Token)
-		ipEntry.SetText(s.ServerIP)
-		
-		// ✅ 加载 ECH 和 DNS 配置
-		echEntry.SetText(s.ECHDomain)
-		dnsEntry.SetText(s.DNSServer)
-		
-		routingSelect.SetSelected(s.RoutingMode)
-	}
-
-	saveBtn := widget.NewButtonWithIcon("保存", theme.DocumentSaveIcon(), func() {
-		idx := getProfileIndex(config, config.CurrentServerID)
-		if idx == -1 {
-			return
-		}
-		s := &config.Servers[idx]
-		s.Name = nameEntry.Text
-		s.ServerAddr = serverEntry.Text
-		s.ListenAddr = listenEntry.Text
-		s.Token = tokenEntry.Text
-		s.ServerIP = ipEntry.Text
-		
-		// ✅ 保存 ECH 和 DNS 配置
-		s.ECHDomain = echEntry.Text
-		if s.ECHDomain == "" {
-			s.ECHDomain = "cloudflare-ech.com"
-		}
-		s.DNSServer = dnsEntry.Text
-		if s.DNSServer == "" {
-			s.DNSServer = "dns.alidns.com/dns-query"
-		}
-		
-		s.RoutingMode = routingSelect.Selected
-		saveConfig(*config)
-		reloadList()
-		dialog.ShowInformation("成功", "配置已保存", w)
+	// 修复：先创建 Select，不立即设置选中值
+	routingSelect := widget.NewSelect([]string{"global", "bypass_cn", "none"}, func(s string) {
+		routingMode = s
 	})
+	routingSelect.PlaceHolder = "选择分流模式"
 
-	newBtn := widget.NewButtonWithIcon("新建", theme.ContentAddIcon(), func() {
-		newS := ServerConfig{
-			ID:          fmt.Sprintf("%d", time.Now().Unix()),
-			Name:        "新配置",
-			ListenAddr:  "127.0.0.1:30000",
-			RoutingMode: "bypass_cn",
-			ECHDomain:   "cloudflare-ech.com",
-			DNSServer:   "dns.alidns.com/dns-query",
-		}
-		config.Servers = append(config.Servers, newS)
-		config.CurrentServerID = newS.ID
-		saveConfig(*config)
-		reloadList()
-		profileList.Select(len(config.Servers) - 1)
+	autoProxyCheck := widget.NewCheck("启动时自动设置系统代理", func(checked bool) {
+		autoProxy = checked
+		prefs.SetBool("autoProxy", autoProxy)
 	})
+	autoProxyCheck.SetChecked(autoProxy)
 
-	delBtn := widget.NewButtonWithIcon("删除", theme.DeleteIcon(), func() {
-		if len(config.Servers) <= 1 {
-			dialog.ShowInformation("提示", "至少保留一个配置", w)
-			return
-		}
-		idx := getProfileIndex(config, config.CurrentServerID)
-		if idx != -1 {
-			config.Servers = append(config.Servers[:idx], config.Servers[idx+1:]...)
-			config.CurrentServerID = config.Servers[0].ID
-			saveConfig(*config)
-			reloadList()
-			profileList.Select(0)
-		}
-	})
-
-	// ✅ 优化表单布局，添加滚动
-	form := widget.NewForm(
-		widget.NewFormItem("节点名称", nameEntry),
-		widget.NewFormItem("服务器地址", serverEntry),
-		widget.NewFormItem("监听地址", listenEntry),
-		widget.NewFormItem("Token", tokenEntry),
-		widget.NewFormItem("指定IP", ipEntry),
-		widget.NewFormItem("ECH域名", echEntry),
-		widget.NewFormItem("DNS服务器", dnsEntry),
-		widget.NewFormItem("路由模式", routingSelect),
+	// 使用统一的 createFormRow 创建所有配置项
+	configContent := container.NewVBox(
+		createFormRow("监听地址", listenEntry),
+		createFormRow("服务器地址", serverEntry),
+		createFormRow("认证令牌", tokenEntry),
+		createFormRow("服务器 IP", serverIPEntry),
+		createFormRow("分流模式", routingSelect),
+		createFormRow("DoH 服务器", dnsEntry),
+		createFormRow("ECH 域名", echEntry),
+		widget.NewSeparator(),
+		container.NewPadded(autoProxyCheck),
 	)
+	configCard := createCard("⚙️ 代理配置", configContent)
 
-	// ✅ 添加滚动容器
-	formScroll := container.NewScroll(form)
-	formScroll.SetMinSize(fyne.NewSize(400, 350))
+	// ========== 控制按钮 ==========
+	var startBtn *widget.Button
 
-	return container.NewHSplit(
-		container.NewBorder(nil, nil, nil, nil, widget.NewCard("节点列表", "", profileList)),
-		container.NewBorder(
-			nil, 
-			container.NewHBox(newBtn, saveBtn, delBtn), 
-			nil, 
-			nil, 
-			widget.NewCard("配置编辑", "", formScroll),
-		),
-	)
-}
-
-func buildAdvancedTab(config *AppConfig) fyne.CanvasObject {
-	logEntry := widget.NewMultiLineEntry()
-	logEntry.TextStyle = fyne.TextStyle{Monospace: true}
-	logEntry.Wrapping = fyne.TextWrapWord
-	logEntry.Bind(logData)
-
-	// ✅ 添加滚动和边框，限制高度
-	logScroll := container.NewScroll(logEntry)
-	
-	// ✅ 添加清空日志按钮
-	clearBtn := widget.NewButton("清空日志", func() {
-		logData.Set("")
-	})
-
-	// ✅ 添加日志级别过滤（可选）
-	filterSelect := widget.NewSelect([]string{"全部", "成功", "警告", "错误"}, func(s string) {
-		// 可以在这里实现日志过滤逻辑
-	})
-	filterSelect.SetSelected("全部")
-
-	topBar := container.NewBorder(
-		nil, nil,
-		widget.NewLabel("过滤:"),
-		clearBtn,
-		filterSelect,
-	)
-
-	// ✅ 使用 Border 布局，顶部是工具栏，中间是日志
-	return container.NewBorder(
-		topBar,
-		nil,
-		nil,
-		nil,
-		logScroll,
-	)
-}
-
-
-// ======================== 核心逻辑 ========================
-
-func startProxyCore() error {
-	atomic.StoreUint64(&totalUp, 0)
-	atomic.StoreUint64(&totalDown, 0)
-
-	if activeConfig.RoutingMode == "bypass_cn" {
-		go loadChinaIPList()
+	enableInputs := func() {
+		listenEntry.Enable()
+		serverEntry.Enable()
+		tokenEntry.Enable()
+		serverIPEntry.Enable()
+		dnsEntry.Enable()
+		echEntry.Enable()
+		routingSelect.Enable()
+		autoProxyCheck.Enable()
 	}
 
-	if activeConfig.ECHDomain == "" {
-		activeConfig.ECHDomain = "cloudflare-ech.com"
-	}
-	if activeConfig.DNSServer == "" {
-		activeConfig.DNSServer = "dns.alidns.com/dns-query"
-	}
-
-	if err := prepareECH(activeConfig.ECHDomain, activeConfig.DNSServer); err != nil {
-		return err
-	}
-
-	l, err := net.Listen("tcp", activeConfig.ListenAddr)
-	if err != nil {
-		return err
+	disableInputs := func() {
+		listenEntry.Disable()
+		serverEntry.Disable()
+		tokenEntry.Disable()
+		serverIPEntry.Disable()
+		dnsEntry.Disable()
+		echEntry.Disable()
+		routingSelect.Disable()
+		autoProxyCheck.Disable()
 	}
 
-	proxyListener = l
-	proxyCtx, proxyCancel = context.WithCancel(context.Background())
-	guiLog("服务启动: %s", activeConfig.ListenAddr)
-
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				select {
-				case <-proxyCtx.Done():
-					return
-				default:
-					time.Sleep(time.Second)
-					continue
-				}
+	startBtn = widget.NewButton("启动代理", func() {
+		if isRunning.Load() {
+			// 停止代理
+			if proxyListener != nil {
+				proxyListener.Close()
 			}
-			go handleConnection(conn)
-		}
-	}()
-	return nil
-}
+			isRunning.Store(false)
 
-func stopProxyCore() {
-	if proxyCancel != nil {
-		proxyCancel()
-	}
-	if proxyListener != nil {
-		proxyListener.Close()
-	}
-}
-
-func handleConnection(conn net.Conn) {
-	conn = &CountConn{Conn: conn}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
-
-	if buf[0] == 0x05 {
-		handleSOCKS5(conn)
-	} else {
-		handleHTTP(conn, buf[0])
-	}
-}
-
-func handleSOCKS5(conn net.Conn) {
-	io.ReadFull(conn, make([]byte, 1))
-	buf := make([]byte, 256)
-	conn.Read(buf)
-	conn.Write([]byte{0x05, 0x00})
-
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-		return
-	}
-
-	cmd := buf[1]
-	atyp := buf[3]
-	var host string
-
-	switch atyp {
-	case 1:
-		io.ReadFull(conn, buf[:4])
-		host = net.IP(buf[:4]).String()
-	case 3:
-		io.ReadFull(conn, buf[:1])
-		l := int(buf[0])
-		io.ReadFull(conn, buf[:l])
-		host = string(buf[:l])
-	case 4:
-		io.ReadFull(conn, buf[:16])
-		host = net.IP(buf[:16]).String()
-	}
-
-	io.ReadFull(conn, buf[:2])
-	target := fmt.Sprintf("%s:%d", host, binary.BigEndian.Uint16(buf[:2]))
-
-	if cmd == 1 {
-		startTunnel(conn, target, 1, "")
-	} else {
-		conn.Write([]byte{0x05, 0x07})
-	}
-}
-
-func handleHTTP(conn net.Conn, firstByte byte) {
-	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn))
-	reqLine, err := reader.ReadString('\n')
-	if err != nil {
-		return
-	}
-
-	parts := strings.Fields(reqLine)
-	if len(parts) < 2 {
-		return
-	}
-
-	method, urlStr := parts[0], parts[1]
-
-	if method == "CONNECT" {
-		startTunnel(conn, urlStr, 2, "")
-	} else {
-		target := urlStr
-		if u, err := url.Parse(urlStr); err == nil {
-			target = u.Host
-			if !strings.Contains(target, ":") {
-				target += ":80"
+			// 关闭系统代理
+			if autoProxy {
+				setSystemProxy(false, "")
 			}
-		}
 
-		var buf bytes.Buffer
-		buf.WriteString(reqLine)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil || line == "\r\n" {
-				buf.WriteString("\r\n")
-				break
-			}
-			if !strings.HasPrefix(strings.ToLower(line), "proxy-") {
-				buf.WriteString(line)
-			}
-		}
-		if reader.Buffered() > 0 {
-			b, _ := reader.Peek(reader.Buffered())
-			buf.Write(b)
-		}
-		startTunnel(conn, target, 3, buf.String())
-	}
-}
+			statusText.Set("已停止")
+			statusIndicator.FillColor = color.NRGBA{R: 244, G: 67, B: 54, A: 255}
+			statusIndicator.Refresh()
+			startBtn.SetText("启动代理")
+			startBtn.Importance = widget.HighImportance
+			enableInputs()
+		} else {
+			// 启动代理
+			listenAddr = listenEntry.Text
+			serverAddr = serverEntry.Text
+			serverIP = serverIPEntry.Text
+			token = tokenEntry.Text
+			dnsServer = dnsEntry.Text
+			echDomain = echEntry.Text
 
-func startTunnel(conn net.Conn, target string, mode int, firstFrame string) {
-	host, _, _ := net.SplitHostPort(target)
-	if shouldBypass(host) {
-		guiLog("[直连] %s", host)
-		handleDirect(conn, target, mode, firstFrame)
-		return
-	}
-	guiLog("[代理] %s", host)
-
-	ws, err := dialWS(2)
-	if err != nil {
-		guiLog("[Error] %v", err)
-		return
-	}
-	defer ws.Close()
-
-	conn.SetDeadline(time.Time{})
-	ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)))
-
-	_, msg, err := ws.ReadMessage()
-	if err != nil || string(msg) != "CONNECTED" {
-		return
-	}
-
-	if mode == 1 {
-		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	} else if mode == 2 {
-		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
-
-	done := make(chan struct{})
-	var once sync.Once
-	closeDone := func() {
-		once.Do(func() { close(done) })
-	}
-
-	go func() {
-		for {
-			r, _ := rand.Int(rand.Reader, big.NewInt(10000))
-			interval := 10*time.Second + time.Duration(r.Int64())*time.Millisecond
-			select {
-			case <-time.After(interval):
-				ws.WriteMessage(websocket.PingMessage, nil)
-			case <-done:
+			if serverAddr == "" {
+				dialog.ShowError(errors.New("请输入服务器地址"), myWindow)
 				return
 			}
+
+			prefs.SetString("listenAddr", listenAddr)
+			prefs.SetString("serverAddr", serverAddr)
+			prefs.SetString("serverIP", serverIP)
+			prefs.SetString("token", token)
+			prefs.SetString("dnsServer", dnsServer)
+			prefs.SetString("echDomain", echDomain)
+			prefs.SetString("routingMode", routingMode)
+
+			disableInputs()
+			startBtn.SetText("正在启动...")
+			startBtn.Disable()
+			statusText.Set("正在启动...")
+
+			go func() {
+				log.Printf("[启动] 正在获取 ECH 配置...")
+				if err := prepareECH(); err != nil {
+					log.Printf("[错误] 获取 ECH 失败: %v", err)
+					fyne.Do(func() {
+						statusText.Set("启动失败")
+						startBtn.SetText("启动代理")
+						startBtn.Importance = widget.HighImportance
+						startBtn.Enable()
+						enableInputs()
+					})
+					return
+				}
+
+				if routingMode == "bypass_cn" {
+					log.Printf("[启动] 加载分流规则...")
+					loadChinaIPList()
+					loadChinaIPV6List()
+				}
+
+				if err := startProxyListener(); err != nil {
+					log.Printf("[错误] 监听失败: %v", err)
+					fyne.Do(func() {
+						statusText.Set("启动失败")
+						startBtn.SetText("启动代理")
+						startBtn.Importance = widget.HighImportance
+						startBtn.Enable()
+						enableInputs()
+					})
+					return
+				}
+
+				// 设置系统代理
+				if autoProxy {
+					if err := setSystemProxy(true, listenAddr); err != nil {
+						log.Printf("[警告] 设置系统代理失败: %v", err)
+					}
+				}
+
+				isRunning.Store(true)
+				fyne.Do(func() {
+					statusText.Set(fmt.Sprintf("运行中 - %s", listenAddr))
+					statusIndicator.FillColor = color.NRGBA{R: 76, G: 175, B: 80, A: 255}
+					statusIndicator.Refresh()
+					startBtn.SetText("停止代理")
+					startBtn.Importance = widget.DangerImportance
+					startBtn.Enable()
+				})
+			}()
+		}
+	})
+	startBtn.Importance = widget.HighImportance
+
+	// 按钮固定大小
+	buttonBox := container.NewGridWrap(fyne.NewSize(360, 45), startBtn)
+	buttonContainer := container.NewCenter(buttonBox)
+
+	// ========== 左侧面板 ==========
+	leftPanel := container.NewVBox(
+		statsCard,
+		configCard,
+		buttonContainer,
+	)
+
+	// 使用 Max 容器包装左侧面板，确保固定宽度
+	leftPanelWithPadding := container.NewPadded(leftPanel)
+	leftContainer := container.NewGridWrap(fyne.NewSize(420, 680), leftPanelWithPadding)
+
+	// ========== 日志面板 ==========
+	logTextWidget = widget.NewMultiLineEntry()
+	logTextWidget.Wrapping = fyne.TextWrapWord
+	logTextWidget.TextStyle = fyne.TextStyle{Monospace: true}
+	logTextWidget.Disable() // 只读
+
+	logScroll := container.NewScroll(logTextWidget)
+	logScroll.SetMinSize(fyne.NewSize(400, 600))
+	logCard := createCard("📝 运行日志", logScroll)
+
+	// ========== 主布局 ==========
+	mainContent := container.NewBorder(
+		nil, nil,
+		leftContainer, nil,
+		logCard,
+	)
+
+	// 底部状态栏
+	versionLabel := widget.NewLabel("ECH Proxy v1.0")
+	versionLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	bottomBar := container.NewBorder(
+		widget.NewSeparator(),
+		nil, nil, nil,
+		container.NewPadded(versionLabel),
+	)
+
+	// 最终布局
+	content := container.NewBorder(nil, bottomBar, nil, nil, mainContent)
+	myWindow.SetContent(content)
+
+	// 修复：在设置内容后再设置 Select 的选中值
+	routingSelect.SetSelected(routingMode)
+
+	// 流量监控定时器
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		var lastUp, lastDown uint64
+		for range ticker.C {
+			currUp := totalUpload.Load()
+			currDown := totalDownload.Load()
+
+			diffUp := float64(currUp - lastUp)
+			diffDown := float64(currDown - lastDown)
+
+			lastUp = currUp
+			lastDown = currDown
+
+			upSpd := formatSpeed(diffUp)
+			downSpd := formatSpeed(diffDown)
+			upTotal := formatSize(float64(currUp))
+			downTotal := formatSize(float64(currDown))
+
+			fyne.Do(func() {
+				uploadSpeed.Set(upSpd)
+				downloadSpeed.Set(downSpd)
+				uploadTotal.Set(upTotal)
+				downloadTotal.Set(downTotal)
+			})
 		}
 	}()
+
+	// 窗口关闭清理
+	myWindow.SetOnClosed(func() {
+		if isRunning.Load() {
+			if proxyListener != nil {
+				proxyListener.Close()
+			}
+			if autoProxy {
+				setSystemProxy(false, "")
+			}
+		}
+	})
+
+	// 修复：使用 Canvas 的 SetOnTypedKey 确保布局完成后刷新
+	myWindow.Canvas().SetOnTypedKey(func(ke *fyne.KeyEvent) {})
+	
+	// 延迟刷新，确保所有组件初始化完成
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		fyne.Do(func() {
+			myWindow.Content().Refresh()
+			// 再次刷新确保布局正确
+			time.Sleep(50 * time.Millisecond)
+			myWindow.Canvas().Content().Refresh()
+		})
+	}()
+
+	myWindow.ShowAndRun()
+}
+
+
+type TrafficConn struct {
+	net.Conn
+}
+
+func (c *TrafficConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if n > 0 {
+		totalUpload.Add(uint64(n))
+	}
+	return
+}
+
+func (c *TrafficConn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if n > 0 {
+		totalDownload.Add(uint64(n))
+	}
+	return
+}
+
+func startProxyListener() error {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
+	proxyListener = listener
+	log.Printf("[代理] 服务器启动: %s", listenAddr)
+	log.Printf("[代理] 后端: %s", serverAddr)
 
 	go func() {
-		defer closeDone()
-		buf := make([]byte, 32*1024)
 		for {
-			n, err := conn.Read(buf)
+			conn, err := listener.Accept()
 			if err != nil {
-				break
+				if isRunning.Load() {
+					log.Printf("[代理] Accept 错误: %v", err)
+				}
+				return
 			}
-			ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+			wrappedConn := &TrafficConn{Conn: conn}
+			go handleConnection(wrappedConn)
 		}
 	}()
-
-	for {
-		mt, d, err := ws.ReadMessage()
-		if err != nil {
-			break
-		}
-		if mt == websocket.TextMessage && string(d) == "CLOSE" {
-			break
-		}
-		if mt == websocket.BinaryMessage || mt == websocket.TextMessage {
-			conn.Write(d)
-		}
-	}
-	closeDone()
-}
-
-func handleDirect(conn net.Conn, target string, mode int, firstFrame string) {
-	remote, err := net.DialTimeout("tcp", target, 5*time.Second)
-	if err != nil {
-		return
-	}
-	defer remote.Close()
-
-	if mode == 1 {
-		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	} else if mode == 2 {
-		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
-
-	if firstFrame != "" {
-		remote.Write([]byte(firstFrame))
-	}
-
-	go io.Copy(remote, conn)
-	io.Copy(conn, remote)
-}
-
-// ======================== ECH 支持 ========================
-
-func setECHConfig(config *tls.Config, echList []byte) error {
-	configValue := reflect.ValueOf(config).Elem()
-
-	field1 := configValue.FieldByName("EncryptedClientHelloConfigList")
-	if !field1.IsValid() || !field1.CanSet() {
-		return fmt.Errorf("EncryptedClientHelloConfigList 字段不可用，需要 Go 1.23+")
-	}
-	field1.Set(reflect.ValueOf(echList))
-
-	field2 := configValue.FieldByName("EncryptedClientHelloRejectionVerify")
-	if !field2.IsValid() || !field2.CanSet() {
-		return fmt.Errorf("EncryptedClientHelloRejectionVerify 字段不可用，需要 Go 1.23+")
-	}
-	rejectionFunc := func(cs tls.ConnectionState) error {
-		guiLog("[警告] 服务器拒绝 ECH")
-		return errors.New("服务器拒绝 ECH")
-	}
-	field2.Set(reflect.ValueOf(rejectionFunc))
-
 	return nil
 }
 
-func buildTLSConfigWithECH(serverName string, echList []byte) (*tls.Config, error) {
-	roots, err := x509.SystemCertPool()
+func ipToUint32(ip net.IP) uint32 {
+	ip = ip.To4()
+	if ip == nil {
+		return 0
+	}
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+}
+
+func isChinaIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.To4() != nil {
+		ipUint32 := ipToUint32(ip)
+		if ipUint32 == 0 {
+			return false
+		}
+		chinaIPRangesMu.RLock()
+		defer chinaIPRangesMu.RUnlock()
+		left, right := 0, len(chinaIPRanges)
+		for left < right {
+			mid := (left + right) / 2
+			r := chinaIPRanges[mid]
+			if ipUint32 < r.start {
+				right = mid
+			} else if ipUint32 > r.end {
+				left = mid + 1
+			} else {
+				return true
+			}
+		}
+		return false
+	}
+	ipBytes := ip.To16()
+	if ipBytes == nil {
+		return false
+	}
+	var ipArray [16]byte
+	copy(ipArray[:], ipBytes)
+	chinaIPV6RangesMu.RLock()
+	defer chinaIPV6RangesMu.RUnlock()
+	left, right := 0, len(chinaIPV6Ranges)
+	for left < right {
+		mid := (left + right) / 2
+		r := chinaIPV6Ranges[mid]
+		cmpStart := compareIPv6(ipArray, r.start)
+		if cmpStart < 0 {
+			right = mid
+			continue
+		}
+		cmpEnd := compareIPv6(ipArray, r.end)
+		if cmpEnd > 0 {
+			left = mid + 1
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func compareIPv6(a, b [16]byte) int {
+	for i := 0; i < 16; i++ {
+		if a[i] < b[i] {
+			return -1
+		} else if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+func downloadIPList(urlStr, filePath string) error {
+	log.Printf("[下载] 正在下载 IP 列表: %s", urlStr)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(urlStr)
 	if err != nil {
-		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
+		return fmt.Errorf("下载失败: %w", err)
 	}
-
-	if echList == nil || len(echList) == 0 {
-		return nil, errors.New("ECH 配置为空")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
 	}
-
-	config := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		ServerName: serverName,
-		RootCAs:    roots,
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取下载内容失败: %w", err)
 	}
-
-	if err := setECHConfig(config, echList); err != nil {
-		return nil, fmt.Errorf("设置 ECH 配置失败: %w", err)
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		return fmt.Errorf("保存文件失败: %w", err)
 	}
+	log.Printf("[下载] 已保存到: %s", filePath)
+	return nil
+}
 
-	return config, nil
+func loadChinaIPList() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取可执行文件路径失败: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	ipListFile := filepath.Join(exeDir, "chn_ip.txt")
+	if _, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		ipListFile = "chn_ip.txt"
+	}
+	needDownload := false
+	if info, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		needDownload = true
+		log.Printf("[加载] IPv4 列表文件不存在，将自动下载")
+	} else if info.Size() == 0 {
+		needDownload = true
+		log.Printf("[加载] IPv4 列表文件为空，将自动下载")
+	}
+	if needDownload {
+		urlStr := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt"
+		if err := downloadIPList(urlStr, ipListFile); err != nil {
+			return fmt.Errorf("自动下载 IPv4 列表失败: %w", err)
+		}
+	}
+	file, err := os.Open(ipListFile)
+	if err != nil {
+		return fmt.Errorf("打开IP列表文件失败: %w", err)
+	}
+	defer file.Close()
+	var ranges []ipRange
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		startIP := net.ParseIP(parts[0])
+		endIP := net.ParseIP(parts[1])
+		if startIP == nil || endIP == nil {
+			continue
+		}
+		start := ipToUint32(startIP)
+		end := ipToUint32(endIP)
+		if start > 0 && end > 0 && start <= end {
+			ranges = append(ranges, ipRange{start: start, end: end})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取IP列表文件失败: %w", err)
+	}
+	if len(ranges) == 0 {
+		return errors.New("IP列表为空")
+	}
+	for i := 0; i < len(ranges)-1; i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			if ranges[i].start > ranges[j].start {
+				ranges[i], ranges[j] = ranges[j], ranges[i]
+			}
+		}
+	}
+	chinaIPRangesMu.Lock()
+	chinaIPRanges = ranges
+	chinaIPRangesMu.Unlock()
+	return nil
+}
+
+func loadChinaIPV6List() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取可执行文件路径失败: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	ipListFile := filepath.Join(exeDir, "chn_ip_v6.txt")
+	if _, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		ipListFile = "chn_ip_v6.txt"
+	}
+	needDownload := false
+	if info, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		needDownload = true
+		log.Printf("[加载] IPv6 列表文件不存在，将自动下载")
+	} else if info.Size() == 0 {
+		needDownload = true
+		log.Printf("[加载] IPv6 列表文件为空，将自动下载")
+	}
+	if needDownload {
+		urlStr := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip_v6.txt"
+		if err := downloadIPList(urlStr, ipListFile); err != nil {
+			log.Printf("[警告] 自动下载 IPv6 列表失败: %v", err)
+			return nil
+		}
+	}
+	file, err := os.Open(ipListFile)
+	if err != nil {
+		log.Printf("[警告] 打开 IPv6 IP列表文件失败: %v", err)
+		return nil
+	}
+	defer file.Close()
+	var ranges []ipRangeV6
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		startIP := net.ParseIP(parts[0])
+		endIP := net.ParseIP(parts[1])
+		if startIP == nil || endIP == nil {
+			continue
+		}
+		startBytes := startIP.To16()
+		endBytes := endIP.To16()
+		if startBytes == nil || endBytes == nil {
+			continue
+		}
+		var start, end [16]byte
+		copy(start[:], startBytes)
+		copy(end[:], endBytes)
+		if compareIPv6(start, end) <= 0 {
+			ranges = append(ranges, ipRangeV6{start: start, end: end})
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取IPv6 IP列表文件失败: %w", err)
+	}
+	if len(ranges) == 0 {
+		return nil
+	}
+	for i := 0; i < len(ranges)-1; i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			if compareIPv6(ranges[i].start, ranges[j].start) > 0 {
+				ranges[i], ranges[j] = ranges[j], ranges[i]
+			}
+		}
+	}
+	chinaIPV6RangesMu.Lock()
+	chinaIPV6Ranges = ranges
+	chinaIPV6RangesMu.Unlock()
+	return nil
+}
+
+func shouldBypassProxy(targetHost string) bool {
+	if routingMode == "none" {
+		return true
+	}
+	if routingMode == "global" {
+		return false
+	}
+	if routingMode == "bypass_cn" {
+		if ip := net.ParseIP(targetHost); ip != nil {
+			return isChinaIP(targetHost)
+		}
+		ips, err := net.LookupIP(targetHost)
+		if err != nil {
+			return false
+		}
+		for _, ip := range ips {
+			if isChinaIP(ip.String()) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func isNormalCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF {
+		return true
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "normal closure")
+}
+const typeHTTPS = 65
+
+func prepareECH() error {
+	echBase64, err := queryHTTPSRecord(echDomain, dnsServer)
+	if err != nil {
+		return fmt.Errorf("DNS 查询失败: %w", err)
+	}
+	if echBase64 == "" {
+		return errors.New("未找到 ECH 参数")
+	}
+	raw, err := base64.StdEncoding.DecodeString(echBase64)
+	if err != nil {
+		return fmt.Errorf("ECH 解码失败: %w", err)
+	}
+	echListMu.Lock()
+	echList = raw
+	echListMu.Unlock()
+	log.Printf("[ECH] 配置已加载，长度: %d 字节", len(raw))
+	return nil
 }
 
 func refreshECH() error {
-	guiLog("[ECH] 正在刷新配置...")
-	return prepareECH(activeConfig.ECHDomain, activeConfig.DNSServer)
+	log.Printf("[ECH] 刷新配置...")
+	return prepareECH()
 }
 
 func getECHList() ([]byte, error) {
@@ -830,32 +1033,45 @@ func getECHList() ([]byte, error) {
 	return echList, nil
 }
 
-func prepareECH(domain, dns string) error {
-	guiLog("[ECH] 正在获取配置: domain=%s, dns=%s", domain, dns)
-
-	echBase64, err := queryHTTPSRecord(domain, dns)
+func buildTLSConfigWithECH(serverName string, echConfigList []byte) (*tls.Config, error) {
+	roots, err := x509.SystemCertPool()
 	if err != nil {
-		return fmt.Errorf("DNS 查询失败: %w", err)
+		return nil, fmt.Errorf("加载系统根证书失败: %w", err)
 	}
-	if echBase64 == "" {
-		return errors.New("未找到 ECH 参数")
+	if echConfigList == nil || len(echConfigList) == 0 {
+		return nil, errors.New("ECH 配置为空")
 	}
-
-	raw, err := base64.StdEncoding.DecodeString(echBase64)
-	if err != nil {
-		return fmt.Errorf("ECH 解码失败: %w", err)
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		RootCAs:    roots,
 	}
+	if err := setECHConfig(config, echConfigList); err != nil {
+		return nil, fmt.Errorf("设置 ECH 配置失败: %w", err)
+	}
+	return config, nil
+}
 
-	echListMu.Lock()
-	echList = raw
-	echListMu.Unlock()
-
-	guiLog("[成功] ECH 配置已加载，长度: %d 字节", len(raw))
+func setECHConfig(config *tls.Config, echConfigList []byte) error {
+	configValue := reflect.ValueOf(config).Elem()
+	field1 := configValue.FieldByName("EncryptedClientHelloConfigList")
+	if !field1.IsValid() || !field1.CanSet() {
+		return fmt.Errorf("EncryptedClientHelloConfigList 字段不可用，需要 Go 1.23+")
+	}
+	field1.Set(reflect.ValueOf(echConfigList))
+	field2 := configValue.FieldByName("EncryptedClientHelloRejectionVerify")
+	if !field2.IsValid() || !field2.CanSet() {
+		return fmt.Errorf("EncryptedClientHelloRejectionVerify 字段不可用")
+	}
+	rejectionFunc := func(cs tls.ConnectionState) error {
+		return errors.New("服务器拒绝 ECH")
+	}
+	field2.Set(reflect.ValueOf(rejectionFunc))
 	return nil
 }
 
-func queryHTTPSRecord(domain, dnsServer string) (string, error) {
-	dohURL := dnsServer
+func queryHTTPSRecord(domain, dnsServerAddr string) (string, error) {
+	dohURL := dnsServerAddr
 	if !strings.HasPrefix(dohURL, "https://") && !strings.HasPrefix(dohURL, "http://") {
 		dohURL = "https://" + dohURL
 	}
@@ -867,38 +1083,30 @@ func queryDoH(domain, dohURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("无效的 DoH URL: %v", err)
 	}
-
-	const typeHTTPS = 65
 	dnsQuery := buildDNSQuery(domain, typeHTTPS)
 	dnsBase64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
-
 	q := u.Query()
 	q.Set("dns", dnsBase64)
 	u.RawQuery = q.Encode()
-
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return "", fmt.Errorf("创建请求失败: %v", err)
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("Content-Type", "application/dns-message")
-
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("DoH 请求失败: %v", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("DoH 服务器返回错误: %d", resp.StatusCode)
 	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("读取 DoH 响应失败: %v", err)
 	}
-
 	return parseDNSResponse(body)
 }
 
@@ -921,14 +1129,11 @@ func parseDNSResponse(response []byte) (string, error) {
 	if ancount == 0 {
 		return "", errors.New("无应答记录")
 	}
-
 	offset := 12
 	for offset < len(response) && response[offset] != 0 {
 		offset += int(response[offset]) + 1
 	}
 	offset += 5
-
-	const typeHTTPS = 65
 	for i := 0; i < int(ancount); i++ {
 		if offset >= len(response) {
 			break
@@ -953,7 +1158,6 @@ func parseDNSResponse(response []byte) (string, error) {
 		}
 		data := response[offset : offset+int(dataLen)]
 		offset += int(dataLen)
-
 		if rrType == typeHTTPS {
 			if ech := parseHTTPSRecord(data); ech != "" {
 				return ech, nil
@@ -991,359 +1195,587 @@ func parseHTTPSRecord(data []byte) string {
 	}
 	return ""
 }
-
-// ======================== WebSocket 拨号 ========================
-
-func dialWS(maxRetries int) (*websocket.Conn, error) {
-	host, port, _ := net.SplitHostPort(activeConfig.ServerAddr)
-	if host == "" {
-		host = activeConfig.ServerAddr
-		port = "443"
+func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
+	_, port, _, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
 	}
+	dohURL := fmt.Sprintf("https://cloudflare-dns.com:%s/dns-query", port)
+	echBytes, err := getECHList()
+	if err != nil {
+		return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
+	}
+	tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
+	if err != nil {
+		return nil, fmt.Errorf("构建 TLS 配置失败: %w", err)
+	}
+	transport := &http.Transport{
+		TLSClientConfig: tlsCfg,
+	}
+	if serverIP != "" {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, p, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, p))
+		}
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("DoH 请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH 响应错误: %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
 
-	wsURL := fmt.Sprintf("wss://%s:%s/", host, port)
+func parseServerAddr(addr string) (host, port, path string, err error) {
+	path = "/"
+	slashIdx := strings.Index(addr, "/")
+	if slashIdx != -1 {
+		path = addr[slashIdx:]
+		addr = addr[:slashIdx]
+	}
+	host, port, err = net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", "", fmt.Errorf("无效的服务器地址格式: %v", err)
+	}
+	return host, port, path, nil
+}
 
+func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
+	host, port, path, err := parseServerAddr(serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		guiLog("[调试] 尝试连接 (%d/%d): %s", attempt, maxRetries, wsURL)
-
 		echBytes, echErr := getECHList()
 		if echErr != nil {
 			if attempt < maxRetries {
-				guiLog("[警告] ECH 配置未加载，尝试刷新...")
 				refreshECH()
-				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			return nil, fmt.Errorf("ECH 配置错误: %w", echErr)
+			return nil, echErr
 		}
-
 		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
 		if tlsErr != nil {
-			return nil, fmt.Errorf("构建 TLS 配置失败: %w", tlsErr)
+			return nil, tlsErr
 		}
-
-		guiLog("[成功] TLS 配置已构建，ECH 长度: %d", len(echBytes))
-
 		dialer := websocket.Dialer{
-			TLSClientConfig:  tlsCfg,
-			HandshakeTimeout: 15 * time.Second,
+			TLSClientConfig: tlsCfg,
+			Subprotocols: func() []string {
+				if token == "" {
+					return nil
+				}
+				return []string{token}
+			}(),
+			HandshakeTimeout: 10 * time.Second,
 		}
-
-		if activeConfig.Token != "" {
-			dialer.Subprotocols = []string{activeConfig.Token}
-			guiLog("[调试] 使用 Token 认证")
-		}
-
-		if activeConfig.ServerIP != "" {
+		if serverIP != "" {
 			dialer.NetDial = func(network, address string) (net.Conn, error) {
-				_, port, err := net.SplitHostPort(address)
+				_, p, err := net.SplitHostPort(address)
 				if err != nil {
 					return nil, err
 				}
-				targetAddr := net.JoinHostPort(activeConfig.ServerIP, port)
-				guiLog("[调试] 连接到指定 IP: %s", targetAddr)
-				return net.DialTimeout(network, targetAddr, 10*time.Second)
+				return net.DialTimeout(network, net.JoinHostPort(serverIP, p), 10*time.Second)
 			}
 		}
-
 		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
 		if dialErr != nil {
 			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
-				guiLog("[错误] ECH 连接失败，尝试刷新配置: %v", dialErr)
+				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
 				refreshECH()
 				time.Sleep(time.Second)
 				continue
 			}
-
-			guiLog("[错误] 连接失败 (%d/%d): %v", attempt, maxRetries, dialErr)
-			if attempt < maxRetries {
-				time.Sleep(time.Duration(attempt) * time.Second)
-				continue
-			}
-			return nil, fmt.Errorf("连接失败(已重试%d次): %w", maxRetries, dialErr)
+			return nil, dialErr
 		}
-
-		guiLog("[成功] ✓ WebSocket 连接已建立")
 		return wsConn, nil
 	}
-
 	return nil, errors.New("连接失败，已达最大重试次数")
 }
-
-// ======================== 流量统计 ========================
-
-type CountConn struct {
-	net.Conn
-}
-
-func (c *CountConn) Read(b []byte) (int, error) {
-	n, err := c.Conn.Read(b)
-	if n > 0 {
-		atomic.AddUint64(&totalUp, uint64(n))
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	clientAddr := conn.RemoteAddr().String()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return
 	}
-	return n, err
-}
-
-func (c *CountConn) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
-	if n > 0 {
-		atomic.AddUint64(&totalDown, uint64(n))
-	}
-	return n, err
-}
-
-func resetStats() {
-	statusText.Set("未连接")
-	latencyStr.Set("-")
-	speedUpStr.Set("0 KB/s")
-	speedDownStr.Set("0 KB/s")
-	totalStr.Set("0 MB")
-	infoDetails.Set("请选择节点启动")
-}
-
-func startStatsMonitor() {
-	var lastUp, lastDown uint64
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		cUp := atomic.LoadUint64(&totalUp)
-		cDown := atomic.LoadUint64(&totalDown)
-		speedUpStr.Set(fmtBytes(cUp-lastUp) + "/s")
-		speedDownStr.Set(fmtBytes(cDown-lastDown) + "/s")
-		totalStr.Set(fmtBytes(cUp + cDown))
-		lastUp, lastDown = cUp, cDown
+	firstByte := buf[0]
+	switch firstByte {
+	case 0x05:
+		handleSOCKS5(conn, clientAddr, firstByte)
+	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
+		handleHTTP(conn, clientAddr, firstByte)
+	default:
+		log.Printf("[代理] %s 未知协议: 0x%02x", clientAddr, firstByte)
 	}
 }
 
-func latencyMonitorLoop() {
-	for {
-		isRunning, _ := proxyRunning.Get()
-		if !isRunning {
+func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
+	if firstByte != 0x05 {
+		return
+	}
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	nmethods := buf[0]
+	methods := make([]byte, nmethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return
+	}
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return
+	}
+	buf = make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	if buf[0] != 5 {
+		return
+	}
+	command := buf[1]
+	atyp := buf[3]
+	var host string
+	switch atyp {
+	case 0x01:
+		buf = make([]byte, 4)
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			return
 		}
-		host, port, _ := net.SplitHostPort(activeConfig.ServerAddr)
-		if host == "" {
-			host = activeConfig.ServerAddr
-			port = "443"
+		host = net.IP(buf).String()
+	case 0x03:
+		buf = make([]byte, 1)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
 		}
-		target := host + ":" + port
-		if activeConfig.ServerIP != "" {
-			target = activeConfig.ServerIP + ":" + port
+		domainBuf := make([]byte, buf[0])
+		if _, err := io.ReadFull(conn, domainBuf); err != nil {
+			return
 		}
-		start := time.Now()
-		conn, err := net.DialTimeout("tcp", target, 3*time.Second)
-		if err != nil {
-			latencyStr.Set("超时")
+		host = string(domainBuf)
+	case 0x04:
+		buf = make([]byte, 16)
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return
+		}
+		host = net.IP(buf).String()
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+	buf = make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return
+	}
+	port := int(buf[0])<<8 | int(buf[1])
+	switch command {
+	case 0x01:
+		var target string
+		if atyp == 0x04 {
+			target = fmt.Sprintf("[%s]:%d", host, port)
 		} else {
-			conn.Close()
-			latencyStr.Set(fmt.Sprintf("%dms", time.Since(start).Milliseconds()))
+			target = fmt.Sprintf("%s:%d", host, port)
 		}
-		time.Sleep(5 * time.Second)
-	}
-}
-
-func fmtBytes(b uint64) string {
-	if b < 1024 {
-		return fmt.Sprintf("%d B", b)
-	}
-	if b < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(b)/1024)
-	}
-	if b < 1024*1024*1024 {
-		return fmt.Sprintf("%.2f MB", float64(b)/1024/1024)
-	}
-	return fmt.Sprintf("%.2f GB", float64(b)/1024/1024/1024)
-}
-
-// ======================== 配置管理 ========================
-
-func loadConfig() AppConfig {
-	var c AppConfig
-	f, err := os.Open("config.json")
-	if err != nil {
-		return c
-	}
-	defer f.Close()
-	json.NewDecoder(f).Decode(&c)
-	return c
-}
-
-func saveConfig(c AppConfig) {
-	f, _ := os.Create("config.json")
-	e := json.NewEncoder(f)
-	e.SetIndent("", "  ")
-	e.Encode(c)
-	f.Close()
-}
-
-func getProfileIndex(c *AppConfig, id string) int {
-	for i, s := range c.Servers {
-		if s.ID == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func getCurrentProfileName(c *AppConfig) string {
-	i := getProfileIndex(c, c.CurrentServerID)
-	if i != -1 {
-		return c.Servers[i].Name
-	}
-	return "未选择"
-}
-
-func initDefaultRules(cfg *AppConfig) {
-	if len(cfg.BypassDomains) == 0 {
-		cfg.BypassDomains = []string{".cn", ".top", ".local", "baidu.com", "qq.com", "163.com", "taobao.com", "jd.com"}
-	}
-	if len(cfg.BypassKeywords) == 0 {
-		cfg.BypassKeywords = []string{"cn", "baidu", "tencent", "alibaba", "360", "bilibili"}
-	}
-}
-
-// ======================== 分流规则 ========================
-
-func shouldBypass(host string) bool {
-	if activeConfig.RoutingMode == "none" {
-		return true
-	}
-	if activeConfig.RoutingMode == "global" {
-		return false
-	}
-
-	domain := strings.ToLower(host)
-	if h, _, err := net.SplitHostPort(domain); err == nil {
-		domain = h
-	}
-
-	for _, suffix := range globalRules.BypassDomains {
-		if strings.HasSuffix(domain, suffix) {
-			return true
-		}
-	}
-
-	for _, kw := range globalRules.BypassKeywords {
-		if strings.Contains(domain, kw) {
-			return true
-		}
-	}
-
-	ip := net.ParseIP(domain)
-	if ip == nil {
-		if ips, err := net.LookupIP(domain); err == nil && len(ips) > 0 {
-			ip = ips[0]
-		}
-	}
-
-	if ip != nil && isChinaIP(ip) {
-		return true
-	}
-
-	return false
-}
-
-func isChinaIP(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-
-	v := binary.BigEndian.Uint32(ip4)
-	chinaIPRangesMu.RLock()
-	defer chinaIPRangesMu.RUnlock()
-
-	l, r := 0, len(chinaIPRanges)
-	for l < r {
-		m := (l + r) / 2
-		rg := chinaIPRanges[m]
-		if v < rg.start {
-			r = m
-		} else if v > rg.end {
-			l = m + 1
-		} else {
-			return true
-		}
-	}
-	return false
-}
-
-func loadChinaIPList() {
-	path := "chn_ip.txt"
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Get("https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt")
-		if err == nil {
-			defer resp.Body.Close()
-			content, _ := io.ReadAll(resp.Body)
-			if len(content) > 0 {
-				os.WriteFile(path, content, 0644)
+		log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
+		if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, ""); err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
 			}
 		}
+	case 0x03:
+		handleUDPAssociate(conn, clientAddr)
+	default:
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 	}
+}
 
-	f, err := os.Open(path)
+func handleUDPAssociate(tcpConn net.Conn, clientAddr string) {
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	port := localAddr.Port
+	log.Printf("[UDP] %s UDP ASSOCIATE 端口: %d", clientAddr, port)
+	response := []byte{0x05, 0x00, 0x00, 0x01}
+	response = append(response, 127, 0, 0, 1)
+	response = append(response, byte(port>>8), byte(port&0xff))
+	if _, err := tcpConn.Write(response); err != nil {
+		udpConn.Close()
+		return
+	}
+	stopChan := make(chan struct{})
+	go handleUDPRelay(udpConn, clientAddr, stopChan)
+	buf := make([]byte, 1)
+	tcpConn.Read(buf)
+	close(stopChan)
+	udpConn.Close()
+}
+
+func handleUDPRelay(udpConn *net.UDPConn, clientAddr string, stopChan chan struct{}) {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-stopChan:
+			return
+		default:
+		}
+		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, addr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return
+		}
+		if n < 10 {
+			continue
+		}
+		data := buf[:n]
+		if data[2] != 0x00 {
+			continue
+		}
+		atyp := data[3]
+		var headerLen int
+		var dstPort int
+		switch atyp {
+		case 0x01:
+			if n < 10 {
+				continue
+			}
+			dstPort = int(data[8])<<8 | int(data[9])
+			headerLen = 10
+		case 0x03:
+			if n < 5 {
+				continue
+			}
+			domainLen := int(data[4])
+			if n < 7+domainLen {
+				continue
+			}
+			dstPort = int(data[5+domainLen])<<8 | int(data[6+domainLen])
+			headerLen = 7 + domainLen
+		case 0x04:
+			if n < 22 {
+				continue
+			}
+			dstPort = int(data[20])<<8 | int(data[21])
+			headerLen = 22
+		default:
+			continue
+		}
+		udpData := data[headerLen:]
+		if dstPort == 53 {
+			go handleDNSQuery(udpConn, addr, udpData, data[:headerLen])
+		}
+	}
+}
+
+
+func handleDNSQuery(udpConn *net.UDPConn, clientAddr *net.UDPAddr, dnsQuery []byte, socks5Header []byte) {
+	dnsResponse, err := queryDoHForProxy(dnsQuery)
+	if err != nil {
+		log.Printf("[UDP-DNS] DoH 查询失败: %v", err)
+		return
+	}
+	response := make([]byte, 0, len(socks5Header)+len(dnsResponse))
+	response = append(response, socks5Header...)
+	response = append(response, dnsResponse...)
+	udpConn.WriteToUDP(response, clientAddr)
+}
+func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
+	reader := bufio.NewReader(io.MultiReader(strings.NewReader(string(firstByte)), conn))
+	requestLine, err := reader.ReadString('\n')
 	if err != nil {
 		return
 	}
-	defer f.Close()
-
-	var list []ipRange
-	scan := bufio.NewScanner(f)
-	for scan.Scan() {
-		line := strings.TrimSpace(scan.Text())
-		if line == "" || line[0] == '#' {
-			continue
+	parts := strings.Fields(requestLine)
+	if len(parts) < 3 {
+		return
+	}
+	method := parts[0]
+	requestURL := parts[1]
+	httpVersion := parts[2]
+	headers := make(map[string]string)
+	var headerLines []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
 		}
-		p := strings.Fields(line)
-		if len(p) < 2 {
-			continue
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
 		}
-		s, e := net.ParseIP(p[0]), net.ParseIP(p[1])
-		if s != nil && e != nil {
-			s4, e4 := s.To4(), e.To4()
-			if s4 != nil && e4 != nil {
-				list = append(list, ipRange{binary.BigEndian.Uint32(s4), binary.BigEndian.Uint32(e4)})
+		headerLines = append(headerLines, line)
+		if idx := strings.Index(line, ":"); idx > 0 {
+			key := strings.TrimSpace(line[:idx])
+			value := strings.TrimSpace(line[idx+1:])
+			headers[strings.ToLower(key)] = value
+		}
+	}
+	switch method {
+	case "CONNECT":
+		log.Printf("[HTTPS] %s -> %s", clientAddr, requestURL)
+		if err := handleTunnel(conn, requestURL, clientAddr, modeHTTPConnect, ""); err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[HTTPS] %s 失败: %v", clientAddr, err)
 			}
 		}
-	}
-
-	chinaIPRangesMu.Lock()
-	chinaIPRanges = list
-	chinaIPRangesMu.Unlock()
-}
-
-// ======================== 日志和系统代理 ========================
-
-func guiLog(f string, args ...any) {
-	s := fmt.Sprintf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(f, args...))
-	current, _ := logData.Get()
-	
-	// ✅ 限制日志长度，保留最近的 10000 字符
-	if len(current) > 10000 {
-		lines := strings.Split(current, "\n")
-		if len(lines) > 100 {
-			current = strings.Join(lines[len(lines)-100:], "\n")
-		}
-	}
-	
-	logData.Set(current + s)
-}
-
-
-func setSystemProxy(enable bool, listen, mode string) bool {
-	_, port, _ := net.SplitHostPort(listen)
-	if port == "" {
-		return false
-	}
-	if runtime.GOOS == "windows" {
-		if enable {
-			exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f").Run()
-			exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`, "/v", "ProxyServer", "/t", "REG_SZ", "/d", "127.0.0.1:"+port, "/f").Run()
+	case "GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH", "TRACE":
+		log.Printf("[HTTP] %s %s -> %s", method, clientAddr, requestURL)
+		var target, path string
+		if strings.HasPrefix(requestURL, "http://") {
+			urlWithoutScheme := strings.TrimPrefix(requestURL, "http://")
+			idx := strings.Index(urlWithoutScheme, "/")
+			if idx > 0 {
+				target = urlWithoutScheme[:idx]
+				path = urlWithoutScheme[idx:]
+			} else {
+				target = urlWithoutScheme
+				path = "/"
+			}
 		} else {
-			exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
+			target = headers["host"]
+			path = requestURL
 		}
-		return true
+		if target == "" {
+			conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			return
+		}
+		if !strings.Contains(target, ":") {
+			target += ":80"
+		}
+		var requestBuilder strings.Builder
+		requestBuilder.WriteString(fmt.Sprintf("%s %s %s\r\n", method, path, httpVersion))
+		for _, line := range headerLines {
+			key := strings.Split(line, ":")[0]
+			keyLower := strings.ToLower(strings.TrimSpace(key))
+			if keyLower != "proxy-connection" && keyLower != "proxy-authorization" {
+				requestBuilder.WriteString(line)
+				requestBuilder.WriteString("\r\n")
+			}
+		}
+		requestBuilder.WriteString("\r\n")
+		if contentLength := headers["content-length"]; contentLength != "" {
+			var length int
+			fmt.Sscanf(contentLength, "%d", &length)
+			if length > 0 && length < 10*1024*1024 {
+				body := make([]byte, length)
+				if _, err := io.ReadFull(reader, body); err == nil {
+					requestBuilder.Write(body)
+				}
+			}
+		}
+		firstFrame := requestBuilder.String()
+		if err := handleTunnel(conn, target, clientAddr, modeHTTPProxy, firstFrame); err != nil {
+			if !isNormalCloseError(err) {
+				log.Printf("[HTTP] %s 失败: %v", clientAddr, err)
+			}
+		}
+	default:
+		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
 	}
-	return false
+}
+
+const (
+	modeSOCKS5      = 1
+	modeHTTPConnect = 2
+	modeHTTPProxy   = 3
+)
+
+func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
+	targetHost, _, err := net.SplitHostPort(target)
+	if err != nil {
+		targetHost = target
+	}
+	if shouldBypassProxy(targetHost) {
+		log.Printf("[直连] %s -> %s", clientAddr, target)
+		return handleDirectConnection(conn, target, clientAddr, mode, firstFrame)
+	}
+	log.Printf("[代理] %s -> %s", clientAddr, target)
+	wsConn, err := dialWebSocketWithECH(2)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+	defer wsConn.Close()
+	var mu sync.Mutex
+	stopPing := make(chan bool)
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				mu.Lock()
+				wsConn.WriteMessage(websocket.PingMessage, nil)
+				mu.Unlock()
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+	defer close(stopPing)
+	conn.SetDeadline(time.Time{})
+	if firstFrame == "" && mode == modeSOCKS5 {
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		buffer := make([]byte, 32768)
+		n, _ := conn.Read(buffer)
+		conn.SetReadDeadline(time.Time{})
+		if n > 0 {
+			firstFrame = string(buffer[:n])
+		}
+	}
+	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
+	mu.Lock()
+	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
+	mu.Unlock()
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+	_, msg, err := wsConn.ReadMessage()
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return err
+	}
+	response := string(msg)
+	if strings.HasPrefix(response, "ERROR:") {
+		sendErrorResponse(conn, mode)
+		return errors.New(response)
+	}
+	if response != "CONNECTED" {
+		sendErrorResponse(conn, mode)
+		return fmt.Errorf("意外响应: %s", response)
+	}
+	if err := sendSuccessResponse(conn, mode); err != nil {
+		return err
+	}
+	done := make(chan bool, 2)
+	go func() {
+		buf := make([]byte, 32768)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				mu.Lock()
+				wsConn.WriteMessage(websocket.TextMessage, []byte("CLOSE"))
+				mu.Unlock()
+				done <- true
+				return
+			}
+			mu.Lock()
+			err = wsConn.WriteMessage(websocket.BinaryMessage, buf[:n])
+			mu.Unlock()
+			if err != nil {
+				done <- true
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			mt, msg, err := wsConn.ReadMessage()
+			if err != nil {
+				done <- true
+				return
+			}
+			if mt == websocket.TextMessage && string(msg) == "CLOSE" {
+				done <- true
+				return
+			}
+			if _, err := conn.Write(msg); err != nil {
+				done <- true
+				return
+			}
+		}
+	}()
+	<-done
+	return nil
+}
+
+func handleDirectConnection(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+		if mode == modeHTTPConnect || mode == modeHTTPProxy {
+			port = "443"
+		} else {
+			port = "80"
+		}
+		target = net.JoinHostPort(host, port)
+	}
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return fmt.Errorf("直连失败: %w", err)
+	}
+	defer targetConn.Close()
+	if err := sendSuccessResponse(conn, mode); err != nil {
+		return err
+	}
+	if firstFrame != "" {
+		if _, err := targetConn.Write([]byte(firstFrame)); err != nil {
+			return err
+		}
+	}
+	done := make(chan bool, 2)
+	go func() {
+		io.Copy(targetConn, conn)
+		done <- true
+	}()
+	go func() {
+		io.Copy(conn, targetConn)
+		done <- true
+	}()
+	<-done
+	return nil
+}
+
+func sendErrorResponse(conn net.Conn, mode int) {
+	switch mode {
+	case modeSOCKS5:
+		conn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	case modeHTTPConnect, modeHTTPProxy:
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+	}
+}
+
+func sendSuccessResponse(conn net.Conn, mode int) error {
+	switch mode {
+	case modeSOCKS5:
+		_, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return err
+	case modeHTTPConnect:
+		_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		return err
+	case modeHTTPProxy:
+		return nil
+	}
+	return nil
 }
